@@ -28,5 +28,9 @@ class Settings(BaseSettings):
     # Fundamentals
     fundamentals_api_key: str = ""
 
+    # Screener.in
+    screener_userid: str = ""
+    screener_password: str = ""
+
 
 settings = Settings()

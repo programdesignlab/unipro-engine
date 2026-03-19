@@ -147,15 +147,56 @@ def bootstrap_delivery_bulk(years):
 @cli.command()
 @click.option("--symbols", "-s", multiple=True, help="Limit to specific symbols")
 def sync_fundamentals(symbols):
-    """Sync quarterly fundamentals from yfinance for all stocks."""
+    """Sync quarterly fundamentals from yfinance for all stocks (legacy)."""
     from momentum_edge.data.fundamentals import sync_fundamentals as _sync
 
     db = _get_db()
     sym_list = list(symbols) if symbols else None
-    console.print(f"[cyan]Syncing fundamentals...[/cyan]")
+    console.print(f"[cyan]Syncing fundamentals (yfinance)...[/cyan]")
     try:
         _sync(db, symbols=sym_list)
         console.print(f"[green]✓[/green] Fundamentals sync complete")
+    except Exception as e:
+        console.print(f"[red]✗ Error:[/red] {e}")
+        sys.exit(1)
+    finally:
+        db.close()
+
+
+@cli.command()
+@click.option("--symbols", "-s", multiple=True, help="Limit to specific symbols")
+@click.option("--batch", default=500, show_default=True, help="Batch size per run")
+@click.option("--skip-done", is_flag=True, help="Skip stocks that already have Screener fundamentals")
+def sync_screener(symbols, batch, skip_done):
+    """Sync fundamentals + shareholding from Screener.in (recommended)."""
+    from momentum_edge.data.screener import sync_screener_fundamentals
+    from sqlalchemy import text as sql_text
+
+    db = _get_db()
+    sym_list = list(symbols) if symbols else None
+
+    if skip_done and not sym_list:
+        # Only process stocks missing fundamentals from Screener
+        rows = db.execute(sql_text("""
+            SELECT s.symbol FROM stocks s
+            WHERE s.is_active = true
+              AND s.screener_export_id IS NOT NULL
+              AND s.id NOT IN (
+                  SELECT DISTINCT stock_id FROM fundamentals
+                  WHERE revenue IS NOT NULL AND quarter LIKE 'Q%%FY2%%'
+                  AND reporting_date IS NOT NULL
+              )
+            ORDER BY s.symbol
+        """)).fetchall()
+        sym_list = [r[0] for r in rows]
+        console.print(f"[cyan]Screener sync: {len(sym_list)} stocks need fundamentals[/cyan]")
+    else:
+        label = f"{len(sym_list)} symbols" if sym_list else "all active stocks"
+        console.print(f"[cyan]Screener sync: {label}, batch={batch}[/cyan]")
+
+    try:
+        count = sync_screener_fundamentals(db, symbols=sym_list, batch_size=batch)
+        console.print(f"[green]✓[/green] Screener sync: {count} fundamental rows written")
     except Exception as e:
         console.print(f"[red]✗ Error:[/red] {e}")
         sys.exit(1)
@@ -384,6 +425,100 @@ def scan(target_date):
 
     except Exception as e:
         console.print(f"[red]✗ Scan failed:[/red] {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        db.close()
+
+
+@cli.command()
+@click.option("--start", default="2015-01-01", show_default=True, help="Start date YYYY-MM-DD")
+@click.option("--end", default="2024-12-31", show_default=True, help="End date YYYY-MM-DD")
+@click.option("--capital", default=1_000_000, show_default=True, help="Initial capital in Rs")
+def backtest(start, end, capital):
+    """Run a full v7 backtest over historical data."""
+    from momentum_edge.backtest.engine import Backtester, BacktestConfig
+
+    db = _get_db()
+    config = BacktestConfig(
+        start_date=date.fromisoformat(start),
+        end_date=date.fromisoformat(end),
+        initial_capital=capital,
+    )
+    console.print(Panel(
+        f"[bold]Backtest: {start} → {end} | Capital: Rs.{capital:,.0f}[/bold]",
+        expand=False,
+    ))
+
+    try:
+        bt = Backtester(db, config)
+        bt.prepare_data()
+        console.print(f"[green]✓[/green] Data loaded: {len(bt._stock_meta)} stocks")
+        bt.run()
+        console.print(f"[green]✓[/green] Simulation complete: {len(bt.trades)} trades")
+
+        metrics = bt.compute_metrics()
+        console.print()
+        console.print("[bold]Performance Metrics[/bold]")
+        t = Table("Metric", "Value", show_header=True, header_style="bold")
+        for key in ["cagr", "sharpe_ratio", "max_drawdown", "calmar_ratio",
+                     "win_rate", "avg_win_pct", "avg_loss_pct", "expectancy_pct",
+                     "total_trades", "avg_holding_days"]:
+            val = metrics.get(key)
+            if val is not None:
+                if "pct" in key or key in ("cagr", "max_drawdown", "win_rate"):
+                    t.add_row(key, f"{val:.2%}" if abs(val) < 10 else f"{val:.1f}%")
+                elif isinstance(val, float):
+                    t.add_row(key, f"{val:.2f}")
+                else:
+                    t.add_row(key, str(val))
+        console.print(t)
+
+        # Gates
+        gates = metrics.get("passes_gates", {})
+        if gates:
+            console.print()
+            console.print("[bold]Gate Checks[/bold]")
+            for gate, passed in gates.items():
+                icon = "[green]PASS[/green]" if passed else "[red]FAIL[/red]"
+                console.print(f"  {icon} {gate}")
+
+        run_id = bt.save_results("manual_backtest")
+        console.print(f"\n[green]✓[/green] Results saved (run_id={run_id})")
+
+    except Exception as e:
+        console.print(f"[red]✗ Backtest failed:[/red] {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        db.close()
+
+
+@cli.command()
+@click.option("--test", type=int, default=None, help="Run specific test (1-10), or all if omitted")
+def backtest_tests(test):
+    """Run structured backtests (Tests 1-10 from v7 spec)."""
+    from momentum_edge.backtest.test_runner import run_all_tests
+
+    db = _get_db()
+    console.print(Panel("[bold]MomentumEdge v7 — Structured Backtests[/bold]", expand=False))
+
+    try:
+        if test:
+            from momentum_edge.backtest import test_runner
+            func = getattr(test_runner, f"run_test_{test}_{'momentum_weights' if test == 1 else ''}", None)
+            if func:
+                results = func(db)
+                console.print(f"[green]✓[/green] Test {test} complete")
+            else:
+                console.print(f"[red]Test {test} not found[/red]")
+        else:
+            summary = run_all_tests(db)
+            console.print(f"[green]✓[/green] All tests complete")
+    except Exception as e:
+        console.print(f"[red]✗ Error:[/red] {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)

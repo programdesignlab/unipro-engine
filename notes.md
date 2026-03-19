@@ -1,54 +1,169 @@
-Our analysis is validated across all 3 key signals:**
+This is a major strategy overhaul. Here's the backend impact analysis:
 
----
+  Summary: v7 is essentially a rewrite of the scoring/ranking logic
 
-### M2 — Bear Regime ✓
-The search confirms Nifty 50 broke below its 200-DMA in early March 2026, trading ~6.5% below it. Analysts on Business Standard are warning of a bear phase with a 19,000 target. Our classifier correctly picked this up — `Nifty>200MA: False`.
+  The data pipeline (M1 ingestion) is mostly fine. Everything from M2 onwards needs significant rework.
 
-### M3 — Sector Rotation ✓
-The searches confirm a major rotation away from tech/software into **Energy, Utilities, and Industrials** in Q1 2026 — driven by the Iran-Israel conflict pushing Brent crude toward $120/barrel and AI power demand boosting utilities. Our top 3 sectors (Utilities, Energy, Financial Services) match exactly what's happening globally and in India.
+  ---
+  1. Database Schema Changes (HIGH effort)
 
-### Watchlist Stocks ✓
-NTPC is at ₹378 with a 36% 1-year return and gained 8% in February 2026 as part of a broad power sector rally — consistent with our #3 ranking. COALINDIA and ONGC benefiting from the energy spike is textbook.
+  6 new tables needed:
 
----
+  ┌──────────────────────┬────────────────────────────────────────────────────────────┐
+  │        Table         │                          Purpose                           │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ fii_dii_data         │ Daily FII/DII net buy/sell with sector JSONB               │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ shareholding_pattern │ Quarterly promoter/FII/DII holding %                       │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ fii_breach_list      │ Daily NSE FII breach/caution list                          │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ bulk_deals           │ Block/bulk deal log with institution flag                  │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ signals              │ Replaces simple scores — Pending/Confirmed/Failed workflow │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ performance_log      │ Trade tracking (entry/exit/P&L/MFE/MAE)                    │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ backtest_results     │ Test results storage                                       │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ walkforward_results  │ Walk-forward fold results                                  │
+  └──────────────────────┴────────────────────────────────────────────────────────────┘
 
-**Bottom line:** The pipeline is working correctly. Bear regime + Energy/Utilities/PSU banks leading in a defensive environment is exactly what the real market is showing right now.
+  Existing tables need heavy modification:
 
-Sources:
-- [Is Nifty headed towards a bear phase? — Business Standard](https://www.business-standard.com/markets/news/stock-market-outlook-is-nifty-headed-towards-a-bear-phase-analyst-warns-19-000-mark-126030900326_1.html)
-- [Nifty 50 200-day DMA breakdown March 2026 — karanpowar.in](https://karanpowar.in/nifty-50-200-day-dma-breakdown-march-2026/)
-- [NTPC Stock Price — TradingView](https://www.tradingview.com/symbols/NSE-NTPC/)
-- [From Bits to Atoms: The Great 2026 Sector Rotation — FinancialContent
+  ┌──────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │    Table     │                                             Changes                                             │
+  ├──────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │              │ +12 fields: is_asm, is_esm, is_financial, is_fii_capped_sector, promoter_holding_pct,           │
+  │ stocks       │ fii_holding_pct, dii_holding_pct, fii_headroom_pct, is_fii_breached, is_fii_cautioned,          │
+  │              │ free_float_pct, avg_daily_tv_cr                                                                 │
+  ├──────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ price_data   │ +5 fields: adj_close, adj_factor, hit_upper_circuit, hit_lower_circuit, traded_value_cr.        │
+  │              │ Delivery fields merged in (currently separate table)                                            │
+  ├──────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ fundamentals │ +4 fields: reporting_date (critical — all queries filter by this), expected_result_date,        │
+  │              │ analyst_revision, is_financial                                                                  │
+  ├──────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ indicators   │ Near-total redesign — +15 fields: ma200_slope, mom_3m/6m/12_1, raw_score, scaled_score,         │
+  │              │ vol_scalar, mom_quality, obv, adl_ratio, vol_ratio_20/50, delivery_trend, rs_rank               │
+  ├──────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ watchlist    │ Completely different schema — adds tier, signal_id, entry zones, earnings fields, OBV fields    │
+  └──────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────┘
 
+  delivery_data table: v7 merges delivery into price_data. Current separate table becomes redundant for scoring but
+  still used for storage.
 
+  ---
+  2. Scoring Logic Changes (HIGH effort — near-complete rewrite)
 
+  ┌───────────────────────────────┬────────────────────────────────────────────┬─────────────────────────────────┐
+  │            Current            │                     v7                     │             Impact              │
+  ├───────────────────────────────┼────────────────────────────────────────────┼─────────────────────────────────┤
+  │ CANSLIM hard filters (EPS     │ 4 junk filters only (positive EPS 2/4q,    │ Rewrite canslim_score.py        │
+  │ 25%, Revenue 20%, ROE 15%)    │ not ASM, market cap band, liquidity)       │                                 │
+  ├───────────────────────────────┼────────────────────────────────────────────┼─────────────────────────────────┤
+  │ Absolute composite score (max │ Percentile-ranked momentum + vol scaling + │ Rewrite momentum_score.py,      │
+  │  125 pts)                     │  bonus scores                              │ composite_score.py              │
+  ├───────────────────────────────┼────────────────────────────────────────────┼─────────────────────────────────┤
+  │ Delivery % in accumulation    │ Delivery % display only, zero scoring      │ Rewrite accumulation_score.py   │
+  │ score                         │                                            │                                 │
+  ├───────────────────────────────┼────────────────────────────────────────────┼─────────────────────────────────┤
+  │ Simple RS score               │ Multi-timeframe momentum (12-1/6m/3m) with │ Rewrite indicator calculation   │
+  │                               │  volatility scaling                        │                                 │
+  ├───────────────────────────────┼────────────────────────────────────────────┼─────────────────────────────────┤
+  │ 6-condition trend template    │ 8-condition (adds MA200 slope, 20-day      │ Modify trend_template.py        │
+  │                               │ stage 2)                                   │                                 │
+  ├───────────────────────────────┼────────────────────────────────────────────┼─────────────────────────────────┤
+  │ Basic breakout detection      │ Full VCP math + OBV slope during base +    │ Rewrite breakout_patterns.py    │
+  │                               │ circuit exclusion                          │                                 │
+  ├───────────────────────────────┼────────────────────────────────────────────┼─────────────────────────────────┤
+  │ 3-signal market regime        │ 6-signal + crash indicator + stability     │ Rewrite market_regime.py        │
+  │                               │ rule                                       │                                 │
+  └───────────────────────────────┴────────────────────────────────────────────┴─────────────────────────────────┘
 
+  ---
+  3. New Modules Needed (HIGH effort)
 
+  ┌──────────────────────────┬────────────────────────────────────────────────────────────────────────┬────────────┐
+  │          Module          │                                Purpose                                 │ Complexity │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────┼────────────┤
+  │ Signals engine           │ Pending → Confirmed/Failed workflow, 2-day confirmation                │ Medium     │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────┼────────────┤
+  │ Entry rules              │ 7 conditions (volume, close position, circuit, earnings, max entry 3%) │ Medium     │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────┼────────────┤
+  │ Exit engine              │ 9 exit rules (trailing, time, climax, regime, MA200 breach, rebalance) │ High       │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────┼────────────┤
+  │ Position sizing          │ 2% risk rule, portfolio heat (6% max), sector cap (30%)                │ Medium     │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────┼────────────┤
+  │ Corporate actions        │ adj_close calculation, cumulative adj_factor                           │ High       │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────┼────────────┤
+  │ Smart institutional flow │ FII/DII/bulk deal per-stock logic based on promoter holding            │ High       │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────┼────────────┤
+  │ Earnings date tracker    │ expected_result_date, 10-day safety rule                               │ Medium     │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────┼────────────┤
+  │ Backtesting framework    │ 10 tests, walk-forward, survivorship bias handling                     │ Very High  │
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────┼────────────┤
+  │ OBV calculation          │ Full OBV + per-base slope extraction                                   │ Medium     │
+  └──────────────────────────┴────────────────────────────────────────────────────────────────────────┴────────────┘
 
+  ---
+  4. Data Ingestion Changes (MEDIUM effort)
 
+  ┌───────────────────────┬────────────┬───────────────────────────────────────────────┐
+  │        Source         │   Status   │                  Work Needed                  │
+  ├───────────────────────┼────────────┼───────────────────────────────────────────────┤
+  │ NSE bhav copy (OHLCV) │ ✅ Working │ Add adj_close, adj_factor, circuit detection  │
+  ├───────────────────────┼────────────┼───────────────────────────────────────────────┤
+  │ Delivery data         │ ✅ Working │ Keep storing, remove from scoring             │
+  ├───────────────────────┼────────────┼───────────────────────────────────────────────┤
+  │ Corporate actions     │ ❌ New     │ NSE API scraper + adj_factor backfill         │
+  ├───────────────────────┼────────────┼───────────────────────────────────────────────┤
+  │ FII/DII daily         │ ❌ New     │ NSE API scraper → fii_dii_data                │
+  ├───────────────────────┼────────────┼───────────────────────────────────────────────┤
+  │ Shareholding pattern  │ ❌ New     │ Screener/BSE quarterly → shareholding_pattern │
+  ├───────────────────────┼────────────┼───────────────────────────────────────────────┤
+  │ FII breach list       │ ❌ New     │ NSE daily scraper → fii_breach_list           │
+  ├───────────────────────┼────────────┼───────────────────────────────────────────────┤
+  │ Bulk/block deals      │ ❌ New     │ NSE daily scraper → bulk_deals                │
+  ├───────────────────────┼────────────┼───────────────────────────────────────────────┤
+  │ ASM/ESM list          │ ❌ New     │ NSE surveillance page scraper                 │
+  ├───────────────────────┼────────────┼───────────────────────────────────────────────┤
+  │ Earnings dates        │ ❌ New     │ Screener.in → expected_result_date            │
+  └───────────────────────┴────────────┴───────────────────────────────────────────────┘
 
+  ---
+  5. What's Unchanged (can keep as-is)
 
------
+  - nse_bulk.py — bulk CSV downloader
+  - stock_universe.py — Nifty 500 fetch (universe filtering happens separately)
+  - prices.py / delivery.py — ingestion logic (add adj_close field)
+  - nse_indices.py — Nifty 50 index fetch
+  - parquet_store.py — storage layer
+  - config.py — settings (will need new fields)
+  - DB session, Alembic, CLI framework
 
+  ---
+  Effort Estimate
 
-1. Breakout detection only runs for stocks passing M7 (Trend Template)**
+  ┌──────────────────────────────────────────────┬────────────┐
+  │                   Category                   │   Effort   │
+  ├──────────────────────────────────────────────┼────────────┤
+  │ Schema migration (8 new tables, 5 altered)   │ Large      │
+  ├──────────────────────────────────────────────┼────────────┤
+  │ 4 new data source scrapers                   │ Large      │
+  ├──────────────────────────────────────────────┼────────────┤
+  │ Scoring/ranking rewrite (5 modules)          │ Large      │
+  ├──────────────────────────────────────────────┼────────────┤
+  │ New engines (signals, exit, position sizing) │ Large      │
+  ├──────────────────────────────────────────────┼────────────┤
+  │ Corporate actions + adj_close backfill       │ Medium     │
+  ├──────────────────────────────────────────────┼────────────┤
+  │ Backtesting framework                        │ Very Large │
+  ├──────────────────────────────────────────────┼────────────┤
+  │ Trend template + pattern detection updates   │ Medium     │
+  └──────────────────────────────────────────────┴────────────┘
 
-In the pipeline, `detect_pattern()` is only called if `trend.passes = True`. On 2026-03-17 only 5 stocks passed — and those are exactly the 5 in the watchlist.
+  Bottom line: ~70% of the backend scoring/ranking logic needs rewriting. The data ingestion layer is ~80% reusable.
+  The backtesting framework is entirely new and is the single biggest piece of work.
 
-**2. Those 5 stocks passed the trend template but had no active breakout setup on that date**
-
-The 4 pattern checks are strict:
-
-| Pattern | Condition that failed |
-|---|---|
-| VCP | Needs progressively tighter ranges AND last period < 8% range AND contraction ratio < 50% |
-| Base | Needs price range < 10% over 25 days + volume declining 15% |
-| Resistance | Needs price break above 15-day pivot high + volume ≥ 1.5x average |
-| Volume Breakout | Needs up-day + near 20-day high + volume ≥ 2x average |
-
-In a Bear regime, stocks like NTPC, COALINDIA, ONGC are in slow uptrends — not forming tight VCP or explosive breakouts. None hit the thresholds.
-
-This is **correct behavior** — having an uptrend structure (M7 pass) doesn't mean a breakout is imminent. The pattern score distinguishes stocks at a buyable pivot from those just holding their trend.
-
-You'll see pattern data populate in a Bull market when stocks are forming consolidations near highs with volume drying up. Want me to lower the detection thresholds to catch looser setups, or leave them strict?
+  Want me to create a phased implementation plan, or should we start with the schema migration?

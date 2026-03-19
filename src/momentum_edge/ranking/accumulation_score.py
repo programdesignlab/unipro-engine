@@ -1,133 +1,181 @@
 """
-M6 — Institutional Accumulation Detection (max 15 pts).
+M6 — Institutional Accumulation Detection (max 11 pts).
 
-Signals:
-  1. Rising delivery % over last 10 sessions (0-4 pts)
-  2. Up-day volume > down-day volume ratio (0-4 pts)
-  3. Volume contraction during consolidation (0-3 pts)
-  4. Market cap > ₹800 crore (0-2 pts)
-  5. Avg daily traded value > ₹5 crore (0-2 pts)
+v7 scoring:
+  +5  OBV slope rising during base (passed in from breakout_patterns)
+  +4  A/D ratio >= 0.60 (from indicators table)
+  +2  Smart institutional flow positive (FII/DII/bulk deal logic)
 """
 
 from datetime import date, timedelta
 
-import numpy as np
 from loguru import logger
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+# Sectors where FII ownership is capped by regulation
+_FII_CAPPED_SECTORS = frozenset({
+    "Private Bank",
+    "Insurance",
+    "Defence",
+    "Media",
+    "Telecom",
+})
 
-def score_accumulation(db: Session, stock_id: int, symbol: str, target_date: date) -> dict:
-    """
-    Compute accumulation score for a single stock.
-    Returns dict with component scores and total (max 15).
-    """
-    # Get last 30 trading days of price + delivery data
-    rows = db.execute(
+
+def _check_bulk_deal_institutional_buy(
+    db: Session, stock_id: int, target_date: date, lookback_days: int = 30
+) -> bool:
+    """Check bulk_deals table for a recent institutional buy."""
+    row = db.execute(
         text("""
-            SELECT e.date, e.open, e.close, e.volume,
-                   d.delivery_pct, d.traded_qty
-            FROM eod_prices e
-            LEFT JOIN delivery_data d ON d.stock_id = e.stock_id AND d.date = e.date
-            WHERE e.stock_id = :stock_id AND e.date <= :target_date
-            ORDER BY e.date DESC
-            LIMIT 30
+            SELECT 1 FROM bulk_deals
+            WHERE stock_id = :stock_id
+              AND date BETWEEN :start AND :end
+              AND deal_type = 'buy'
+            LIMIT 1
         """),
-        {"stock_id": stock_id, "target_date": target_date},
-    ).fetchall()
+        {
+            "stock_id": stock_id,
+            "start": target_date - timedelta(days=lookback_days),
+            "end": target_date,
+        },
+    ).fetchone()
+    return row is not None
 
-    if len(rows) < 10:
-        return {"symbol": symbol, "total": 0.0, "detail": "insufficient data"}
 
-    # Reverse to chronological order
-    rows = list(reversed(rows))
+def _check_dii_net_positive(
+    db: Session, target_date: date, lookback_days: int = 30
+) -> bool:
+    """Check fii_dii_data for recent net-positive DII flow (market aggregate)."""
+    row = db.execute(
+        text("""
+            SELECT SUM(dii_net_cr) AS total_dii
+            FROM fii_dii_data
+            WHERE date BETWEEN :start AND :end
+        """),
+        {
+            "start": target_date - timedelta(days=lookback_days),
+            "end": target_date,
+        },
+    ).fetchone()
+    return row is not None and row[0] is not None and row[0] > 0
 
-    dates = [r[0] for r in rows]
-    opens = np.array([r[1] for r in rows])
-    closes = np.array([r[2] for r in rows])
-    volumes = np.array([r[3] for r in rows])
-    delivery_pcts = [r[4] for r in rows]
-    traded_qtys = [r[5] for r in rows]
 
-    # 1. Rising delivery % over last 10 sessions (0-4 pts)
-    recent_delivery = [d for d in delivery_pcts[-10:] if d is not None]
-    if len(recent_delivery) >= 5:
-        first_half = np.mean(recent_delivery[:len(recent_delivery)//2])
-        second_half = np.mean(recent_delivery[len(recent_delivery)//2:])
-        delivery_trend = second_half - first_half
-        score_delivery = min(4.0, max(0.0, delivery_trend / 5.0 * 4.0))
-    else:
-        score_delivery = 0.0
+def _check_fii_dii_combined_positive(
+    db: Session, target_date: date, lookback_days: int = 30
+) -> bool:
+    """Check fii_dii_data for combined FII+DII net-positive flow (market aggregate)."""
+    row = db.execute(
+        text("""
+            SELECT SUM(fii_net_cr + dii_net_cr) AS total_flow
+            FROM fii_dii_data
+            WHERE date BETWEEN :start AND :end
+        """),
+        {
+            "start": target_date - timedelta(days=lookback_days),
+            "end": target_date,
+        },
+    ).fetchone()
+    return row is not None and row[0] is not None and row[0] > 0
 
-    # 2. Up-day vs down-day volume ratio (0-4 pts)
-    up_vol = []
-    down_vol = []
-    for i in range(len(closes)):
-        if closes[i] > opens[i]:
-            up_vol.append(volumes[i])
-        elif closes[i] < opens[i]:
-            down_vol.append(volumes[i])
 
-    if up_vol and down_vol:
-        ratio = np.mean(up_vol) / np.mean(down_vol)
-        score_updown = min(4.0, max(0.0, (ratio - 1.0) * 4.0))
-    else:
-        score_updown = 2.0  # neutral
+def _smart_institutional_flow(
+    db: Session, stock_id: int, symbol: str, target_date: date
+) -> tuple[bool, str]:
+    """
+    Determine smart institutional flow based on promoter holding.
 
-    # 3. Volume contraction during consolidation (0-3 pts)
-    # Check if recent volume is decreasing while price range is tightening
-    if len(volumes) >= 20:
-        vol_first = np.mean(volumes[:10])
-        vol_last = np.mean(volumes[-10:])
-        price_range_first = (np.max(closes[:10]) - np.min(closes[:10])) / np.mean(closes[:10]) * 100
-        price_range_last = (np.max(closes[-10:]) - np.min(closes[-10:])) / np.mean(closes[-10:]) * 100
-
-        vol_contracting = vol_last < vol_first * 0.8
-        price_tightening = price_range_last < price_range_first
-
-        if vol_contracting and price_tightening:
-            score_contraction = 3.0
-        elif vol_contracting or price_tightening:
-            score_contraction = 1.5
-        else:
-            score_contraction = 0.0
-    else:
-        score_contraction = 0.0
-
-    # 4. Market cap > ₹800 crore (0-2 pts)
-    mcap_row = db.execute(
-        text("SELECT market_cap FROM stocks WHERE id = :stock_id"),
+    Returns (is_positive, signal_type) where signal_type describes which
+    data source was used: 'bulk_deal', 'dii_only', 'fii_dii_combined',
+    or 'no_data'.
+    """
+    # Fetch promoter holding and sector info from stocks table
+    row = db.execute(
+        text("""
+            SELECT promoter_holding_pct, sector, is_fii_breached
+            FROM stocks
+            WHERE id = :stock_id
+        """),
         {"stock_id": stock_id},
     ).fetchone()
-    market_cap = mcap_row[0] if mcap_row and mcap_row[0] else 0
 
-    if market_cap > 80000:  # yfinance gives market cap in crores * 10M sometimes; adjust
-        score_mcap = 2.0
-    elif market_cap > 40000:
-        score_mcap = 1.0
-    else:
-        score_mcap = 0.0
+    if row is None:
+        return False, "no_data"
 
-    # 5. Avg daily traded value > ₹5 crore (0-2 pts)
-    avg_traded = np.mean([t for t in traded_qtys if t is not None]) if any(t is not None for t in traded_qtys) else 0
-    avg_price = np.mean(closes[-10:])
-    avg_traded_value = avg_traded * avg_price / 1e7  # in crores
+    promoter_pct = row[0] if row[0] is not None else 0.0
+    sector = row[1] or ""
+    is_fii_breached = row[2] if row[2] is not None else False
+    is_fii_capped_sector = sector in _FII_CAPPED_SECTORS
 
-    if avg_traded_value > 50:
-        score_liquidity = 2.0
-    elif avg_traded_value > 5:
-        score_liquidity = 1.0
-    else:
-        score_liquidity = 0.0
+    # Route 1: High promoter / FII-restricted → use bulk deals
+    if promoter_pct > 75 or is_fii_capped_sector or is_fii_breached:
+        positive = _check_bulk_deal_institutional_buy(db, stock_id, target_date)
+        return positive, "bulk_deal"
 
-    total = round(score_delivery + score_updown + score_contraction + score_mcap + score_liquidity, 1)
+    # Route 2: Moderately high promoter → DII only
+    if promoter_pct > 65:
+        positive = _check_dii_net_positive(db, target_date)
+        return positive, "dii_only"
+
+    # Route 3: Lower promoter → FII + DII combined
+    positive = _check_fii_dii_combined_positive(db, target_date)
+    return positive, "fii_dii_combined"
+
+
+def score_accumulation(
+    db: Session,
+    stock_id: int,
+    symbol: str,
+    target_date: date,
+    obv_bonus: int = 0,
+) -> dict:
+    """
+    Compute accumulation score for a single stock (max 11 pts).
+
+    Parameters
+    ----------
+    obv_bonus : int
+        +5 if OBV slope is rising during base (calculated in breakout_patterns
+        and passed in by the pipeline).
+
+    Returns
+    -------
+    dict with total, adl_bonus, obv_bonus, inst_bonus, inst_signal_type.
+    """
+    # --- 1. OBV slope bonus (0 or 5) ---
+    obv_pts = min(5, max(0, obv_bonus))
+
+    # --- 2. A/D ratio from indicators table (0 or 4) ---
+    ad_row = db.execute(
+        text("""
+            SELECT adl_ratio FROM indicators
+            WHERE stock_id = :stock_id AND date = :target_date
+        """),
+        {"stock_id": stock_id, "target_date": target_date},
+    ).fetchone()
+
+    ad_ratio = ad_row[0] if ad_row and ad_row[0] is not None else 0.0
+    adl_bonus = 4 if ad_ratio >= 0.60 else 0
+
+    # --- 3. Smart institutional flow (0 or 2) ---
+    inst_positive, inst_signal_type = _smart_institutional_flow(
+        db, stock_id, symbol, target_date
+    )
+    inst_bonus = 2 if inst_positive else 0
+
+    total = obv_pts + adl_bonus + inst_bonus
+
+    logger.debug(
+        f"[M6] {symbol}: accum={total} "
+        f"(OBV={obv_pts}, ADL={adl_bonus}, inst={inst_bonus} via {inst_signal_type})"
+    )
 
     return {
         "symbol": symbol,
-        "total": min(15.0, total),
-        "score_delivery_trend": round(score_delivery, 1),
-        "score_updown_volume": round(score_updown, 1),
-        "score_vol_contraction": round(score_contraction, 1),
-        "score_market_cap": round(score_mcap, 1),
-        "score_liquidity": round(score_liquidity, 1),
+        "total": total,
+        "obv_bonus": obv_pts,
+        "adl_bonus": adl_bonus,
+        "inst_bonus": inst_bonus,
+        "inst_signal_type": inst_signal_type,
     }

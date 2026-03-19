@@ -3,7 +3,11 @@ M3 — Sector Rotation Ranking.
 
 Groups stocks by sector, calculates 6-month sector performance vs Nifty 50,
 counts 52-week highs per sector, and produces a ranked list.
-Top 3 sectors receive a priority multiplier in the composite score.
+
+v7 simplified scoring:
+  +10  Stock in top 3 sectors
+   -5  Stock in bottom 3 sectors
+    0  Everything else
 """
 
 from dataclasses import dataclass
@@ -79,29 +83,24 @@ def rank_sectors(db: Session, target_date: date) -> list[SectorRank]:
     return results
 
 
-def get_sector_score(sector_ranks: list[SectorRank], sector_name: str) -> float:
+def get_sector_score(sector_ranks: list[SectorRank], sector_name: str, total_sectors: int) -> float:
     """
-    Get the sector score (max 20 pts) for a stock's sector.
-    Top 3 sectors get 20/15/12 pts; others get scaled down.
+    Get the sector bonus for a stock's sector.
+
+    v7 simplified:
+      +10  if stock is in a top-3 sector
+       -5  if stock is in a bottom-3 sector
+        0  otherwise
     """
     if not sector_ranks or not sector_name:
         return 0.0
 
     for sr in sector_ranks:
         if sr.sector_name == sector_name:
-            if sr.rank == 1:
-                return 20.0
-            elif sr.rank == 2:
-                return 15.0
-            elif sr.rank == 3:
-                return 12.0
-            else:
-                # Linear decay from 10 to 0 for remaining sectors
-                total = len(sector_ranks)
-                remaining = total - 3
-                if remaining <= 0:
-                    return 5.0
-                position = sr.rank - 3  # 1-indexed position after top 3
-                return max(0.0, round(10.0 * (1 - position / remaining), 1))
+            if sr.rank <= 3:
+                return 10.0
+            if sr.rank >= total_sectors - 2:
+                return -5.0
+            return 0.0
 
     return 0.0
