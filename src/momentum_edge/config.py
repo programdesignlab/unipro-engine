@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     # FastAPI
     cors_origins: str = ""  # comma-separated origins
 
+    # Neon Auth (Better Auth) — JWT verification
+    neon_auth_base_url: str = ""
+
     # AWS S3
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
