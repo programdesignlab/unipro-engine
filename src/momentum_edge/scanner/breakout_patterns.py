@@ -396,7 +396,8 @@ def _check_entry_rules(
 
 
 def detect_pattern(
-    db: Session, stock_id: int, symbol: str, target_date: date
+    db: Session, stock_id: int, symbol: str, target_date: date,
+    params: dict | None = None,
 ) -> PatternResult:
     """Detect breakout patterns for a single stock.
 

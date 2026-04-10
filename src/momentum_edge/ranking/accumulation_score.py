@@ -129,6 +129,7 @@ def score_accumulation(
     symbol: str,
     target_date: date,
     obv_bonus: int = 0,
+    params: dict | None = None,
 ) -> dict:
     """
     Compute accumulation score for a single stock (max 11 pts).
@@ -143,10 +144,16 @@ def score_accumulation(
     -------
     dict with total, adl_bonus, obv_bonus, inst_bonus, inst_signal_type.
     """
-    # --- 1. OBV slope bonus (0 or 5) ---
-    obv_pts = min(5, max(0, obv_bonus))
+    p = params or {}
+    obv_max = p.get("obv_bonus", 5)
+    ad_threshold = p.get("ad_ratio_threshold", 0.60)
+    ad_bonus_pts = p.get("ad_ratio_bonus", 4)
+    inst_bonus_pts = p.get("inst_flow_bonus", 2)
 
-    # --- 2. A/D ratio from indicators table (0 or 4) ---
+    # --- 1. OBV slope bonus ---
+    obv_pts = min(obv_max, max(0, obv_bonus))
+
+    # --- 2. A/D ratio from indicators table ---
     ad_row = db.execute(
         text("""
             SELECT adl_ratio FROM indicators
@@ -156,13 +163,13 @@ def score_accumulation(
     ).fetchone()
 
     ad_ratio = ad_row[0] if ad_row and ad_row[0] is not None else 0.0
-    adl_bonus = 4 if ad_ratio >= 0.60 else 0
+    adl_bonus = ad_bonus_pts if ad_ratio >= ad_threshold else 0
 
-    # --- 3. Smart institutional flow (0 or 2) ---
+    # --- 3. Smart institutional flow ---
     inst_positive, inst_signal_type = _smart_institutional_flow(
         db, stock_id, symbol, target_date
     )
-    inst_bonus = 2 if inst_positive else 0
+    inst_bonus = inst_bonus_pts if inst_positive else 0
 
     total = obv_pts + adl_bonus + inst_bonus
 

@@ -20,6 +20,7 @@ if origins:
 from momentum_edge.api.routes import (  # noqa
     watchlist, scores, regime, sectors, stocks,
     stock_detail, fii_dii, signals, shareholding,
+    turnaround, strategy, exclusions,
 )
 
 # All /api/v1/* routes require a valid JWT
@@ -33,6 +34,9 @@ api_router.include_router(stock_detail.router)
 api_router.include_router(fii_dii.router)
 api_router.include_router(signals.router)
 api_router.include_router(shareholding.router)
+api_router.include_router(turnaround.router)
+api_router.include_router(strategy.router)
+api_router.include_router(exclusions.router)
 app.include_router(api_router)
 
 

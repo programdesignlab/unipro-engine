@@ -19,7 +19,9 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from momentum_edge.db.models import Stock
-from momentum_edge.data.parquet_store import append_prices
+def append_prices(df):
+    """Legacy parquet store stub — no-op."""
+    pass
 
 
 def _yf_symbol(nse_symbol: str) -> str:

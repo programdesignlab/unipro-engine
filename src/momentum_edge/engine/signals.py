@@ -17,9 +17,9 @@ from momentum_edge.db.models import EODPrice, Signal
 
 
 # ---------------------------------------------------------------------------
-# Tier thresholds
+# Default tier thresholds (overridden by strategy YAML)
 # ---------------------------------------------------------------------------
-_TIER1_REGIMES = {"Bull", "StrongBull"}
+_TIER1_REGIMES = {"Bull", "Strong Bull"}
 _TIER1_SCORE_MIN = 75.0
 _TIER2_PROXIMITY_PCT = 0.03  # within 3% of pivot
 _TIER2_SCORE_MIN = 65.0

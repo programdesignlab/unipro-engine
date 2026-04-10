@@ -70,6 +70,16 @@ class Stock(Base):
     delisted_date: Mapped[date | None] = mapped_column(Date)
     screener_export_id: Mapped[int | None] = mapped_column(Integer)  # Screener.in company export ID
 
+    # v16 additions — hard blocks + scoring
+    bse_code: Mapped[str | None] = mapped_column(String(20))
+    pledge_pct: Mapped[float | None] = mapped_column(Float)          # promoter pledge %
+    sebi_fine_last_24m: Mapped[bool] = mapped_column(Boolean, default=False)
+    lodr_fine_last_12m: Mapped[bool] = mapped_column(Boolean, default=False)
+    sebi_investigation_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    business_pivot_count: Mapped[int] = mapped_column(Integer, default=0)
+    is_psu: Mapped[bool] = mapped_column(Boolean, default=False)
+    beta: Mapped[float | None] = mapped_column(Float)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -171,6 +181,12 @@ class Fundamentals(Base):
     expected_result_date: Mapped[date | None] = mapped_column(Date) # upcoming results date
     analyst_revision: Mapped[float | None] = mapped_column(Float)
     is_financial: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # v16 additions — hard blocks + penalty signals
+    ocf_cr: Mapped[float | None] = mapped_column(Float)             # operating cash flow (crores)
+    opm: Mapped[float | None] = mapped_column(Float)                # operating profit margin %
+    other_income_cr: Mapped[float | None] = mapped_column(Float)
+    trade_receivables_days: Mapped[float | None] = mapped_column(Float)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -291,6 +307,7 @@ class Scores(Base):
     accumulation_score: Mapped[float | None] = mapped_column(Float)
     breakout_score: Mapped[float | None] = mapped_column(Float)
     composite_score: Mapped[float | None] = mapped_column(Float)
+    strategy_hash: Mapped[str | None] = mapped_column(String(12))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
@@ -370,6 +387,134 @@ class Watchlist(Base):
     earnings_date: Mapped[date | None] = mapped_column(Date)
     earnings_flag: Mapped[bool | None] = mapped_column(Boolean)
 
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# Open positions (v16 — persistent position state)
+# ---------------------------------------------------------------------------
+
+
+class OpenPosition(Base):
+    """Active portfolio positions with v16 exit engine state tracking."""
+
+    __tablename__ = "open_positions"
+    __table_args__ = (
+        UniqueConstraint("stock_id", "entry_date", name="uq_openpos_stock_entry"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    stock_id: Mapped[int] = mapped_column(Integer, ForeignKey("stocks.id"), nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    sector: Mapped[str | None] = mapped_column(String(100))
+
+    # Entry info
+    entry_date: Mapped[date] = mapped_column(Date, nullable=False)
+    entry_price: Mapped[float] = mapped_column(Float, nullable=False)
+    shares: Mapped[int] = mapped_column(Integer, nullable=False)
+    position_value: Mapped[float | None] = mapped_column(Float)
+
+    # Current state (updated daily)
+    current_stop: Mapped[float | None] = mapped_column(Float)
+    current_price: Mapped[float | None] = mapped_column(Float)
+    gain_pct: Mapped[float | None] = mapped_column(Float)       # unrealised (entry → current)
+    max_gain_pct: Mapped[float | None] = mapped_column(Float)   # high-water mark
+    holding_days: Mapped[int | None] = mapped_column(Integer)
+
+    # v16 exit engine state
+    gain_phase: Mapped[str | None] = mapped_column(String(30))  # prove_it / let_it_run / working_compounder / monster_run
+    rs_below_floor_weeks: Mapped[int] = mapped_column(Integer, default=0)
+    partial_exits_taken: Mapped[int] = mapped_column(Integer, default=0)
+
+    # v16 monster detection
+    monster_score: Mapped[float | None] = mapped_column(Float)
+    monster_override_active: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Entry context (snapshot at entry time)
+    entry_atr: Mapped[float | None] = mapped_column(Float)
+    entry_adv: Mapped[float | None] = mapped_column(Float)      # avg daily volume at entry
+    entry_regime: Mapped[str | None] = mapped_column(String(20))
+    entry_composite_score: Mapped[float | None] = mapped_column(Float)
+    signal_id: Mapped[int | None] = mapped_column(Integer)
+    pattern_type: Mapped[str | None] = mapped_column(String(20))
+    tier: Mapped[int | None] = mapped_column(Integer)
+
+    # Sizing adjustments
+    correlation_adj_applied: Mapped[bool] = mapped_column(Boolean, default=False)
+    beta_adj_applied: Mapped[bool] = mapped_column(Boolean, default=False)
+    thin_float_adj_applied: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Strategy version
+    strategy_hash: Mapped[str | None] = mapped_column(String(12))
+
+    # Status
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    closed_date: Mapped[date | None] = mapped_column(Date)
+    exit_reason: Mapped[str | None] = mapped_column(String(50))
+    exit_phase: Mapped[str | None] = mapped_column(String(30))
+    exit_rule_name: Mapped[str | None] = mapped_column(String(50))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+# ---------------------------------------------------------------------------
+# Exclusion & audit log (v16)
+# ---------------------------------------------------------------------------
+
+
+class TurnaroundWatch(Base):
+    """v16 Turnaround Watch — early detection of business turnarounds."""
+
+    __tablename__ = "turnaround_watch"
+    __table_args__ = (
+        UniqueConstraint("stock_id", "detected_date", name="uq_turnaround_stock_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    stock_id: Mapped[int] = mapped_column(Integer, ForeignKey("stocks.id"), nullable=False, index=True)
+    detected_date: Mapped[date] = mapped_column(Date, nullable=False)
+    eps_trend: Mapped[dict | None] = mapped_column(JSONB)       # last 8 quarters EPS
+    revenue_growth_yoy: Mapped[float | None] = mapped_column(Float)
+    suppressed: Mapped[bool] = mapped_column(Boolean, default=False)
+    suppression_reason: Mapped[str | None] = mapped_column(Text)
+    notified: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(20), default="watching")  # watching / cleared / expired
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class PipelineLog(Base):
+    """Step-by-step pipeline execution log."""
+
+    __tablename__ = "pipeline_log"
+    __table_args__ = (
+        UniqueConstraint("date", "phase", name="uq_pipeline_date_phase"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    phase: Mapped[str] = mapped_column(String(50), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # started / complete / failed
+    strategy_hash: Mapped[str | None] = mapped_column(String(12))
+    duration_seconds: Mapped[float | None] = mapped_column(Float)
+    row_count: Mapped[int | None] = mapped_column(Integer)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class ExclusionLog(Base):
+    """Audit trail for universe filter exclusions."""
+
+    __tablename__ = "exclusion_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    stock_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    block_name: Mapped[str] = mapped_column(String(50), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    data_missing: Mapped[bool] = mapped_column(Boolean, default=False)
+    strategy_hash: Mapped[str | None] = mapped_column(String(12))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

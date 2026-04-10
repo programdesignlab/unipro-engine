@@ -32,10 +32,10 @@ class TrendTemplateResult:
 
 
 def _check_stage2_established(
-    db: Session, stock_id: int, target_date: date
+    db: Session, stock_id: int, target_date: date, min_days: int = 20
 ) -> bool:
     """
-    Check if adj_close > ma200 for the last 20 consecutive trading days
+    Check if adj_close > ma200 for the last `min_days` consecutive trading days
     up to and including target_date.
     """
     rows = db.execute(
@@ -45,12 +45,12 @@ def _check_stage2_established(
             JOIN indicators i ON i.stock_id = e.stock_id AND i.date = e.date
             WHERE e.stock_id = :stock_id AND e.date <= :target_date
             ORDER BY e.date DESC
-            LIMIT 20
+            LIMIT :min_days
         """),
-        {"stock_id": stock_id, "target_date": target_date},
+        {"stock_id": stock_id, "target_date": target_date, "min_days": min_days},
     ).fetchall()
 
-    if len(rows) < 20:
+    if len(rows) < min_days:
         return False
 
     return all(
@@ -60,7 +60,8 @@ def _check_stage2_established(
 
 
 def passes_trend_template(
-    db: Session, stock_id: int, symbol: str, target_date: date
+    db: Session, stock_id: int, symbol: str, target_date: date,
+    params: dict | None = None,
 ) -> TrendTemplateResult:
     """
     Apply Minervini's 8-condition trend template (v7).
@@ -98,8 +99,13 @@ def passes_trend_template(
     c4 = ma50 > ma150              # 50MA > 150MA
     c5 = ma150 > ma200             # 150MA > 200MA
     c6 = ma200_slope > 0           # 200MA slope rising
-    c7 = adj_close >= high_52w * 0.80  # Within 20% of 52w high
-    c8 = _check_stage2_established(db, stock_id, target_date)  # 20 days above MA200
+    p = params or {}
+    conditions_cfg = p.get("conditions", {})
+    near_52w_pct = conditions_cfg.get("near_52w_high_pct", 0.80)
+    stage2_days = conditions_cfg.get("stage2_min_days", 20)
+
+    c7 = adj_close >= high_52w * near_52w_pct
+    c8 = _check_stage2_established(db, stock_id, target_date, min_days=stage2_days)
 
     conditions = [c1, c2, c3, c4, c5, c6, c7, c8]
     conditions_met = sum(conditions)
@@ -122,17 +128,19 @@ def passes_trend_template(
         "high_52w": round(float(high_52w), 2),
     }
 
-    # Technical score (max 15):
-    #   Base: (conditions_met / 8) * 12  — max 12 from conditions
-    #   Proximity bonus: up to 3 pts based on closeness to 52w high
-    base_score = (conditions_met / 8.0) * 12.0
+    # Technical score (configurable max)
+    base_max = p.get("base_score_max", 12.0)
+    prox_max = p.get("proximity_bonus_max", 3.0)
+    tech_max = p.get("technical_score_max", 15.0)
+
+    base_score = (conditions_met / 8.0) * base_max
     if high_52w > 0:
         proximity = adj_close / high_52w
-        proximity_bonus = min(3.0, max(0.0, (proximity - 0.80) / 0.20 * 3.0))
+        proximity_bonus = min(prox_max, max(0.0, (proximity - near_52w_pct) / (1.0 - near_52w_pct) * prox_max))
     else:
         proximity_bonus = 0.0
 
-    technical_score = min(15.0, round(base_score + proximity_bonus, 1))
+    technical_score = min(tech_max, round(base_score + proximity_bonus, 1))
 
     return TrendTemplateResult(
         symbol=symbol,

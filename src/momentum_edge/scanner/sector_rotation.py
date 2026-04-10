@@ -28,7 +28,7 @@ class SectorRank:
     is_top3: bool
 
 
-def rank_sectors(db: Session, target_date: date) -> list[SectorRank]:
+def rank_sectors(db: Session, target_date: date, params: dict | None = None) -> list[SectorRank]:
     """
     Rank sectors by momentum strength. Returns sorted list of SectorRank.
     Requires indicators and eod_prices populated for target_date.
@@ -83,24 +83,33 @@ def rank_sectors(db: Session, target_date: date) -> list[SectorRank]:
     return results
 
 
-def get_sector_score(sector_ranks: list[SectorRank], sector_name: str, total_sectors: int) -> float:
+def get_sector_score(
+    sector_ranks: list[SectorRank],
+    sector_name: str,
+    total_sectors: int,
+    params: dict | None = None,
+) -> float:
     """
     Get the sector bonus for a stock's sector.
 
-    v7 simplified:
-      +10  if stock is in a top-3 sector
-       -5  if stock is in a bottom-3 sector
-        0  otherwise
+    Reads top_n, top_n_bonus, bottom_n, bottom_n_penalty from strategy params.
+    Defaults to v7 values: top 3 = +10, bottom 3 = -5.
     """
     if not sector_ranks or not sector_name:
         return 0.0
 
+    p = params or {}
+    top_n = p.get("top_n", 3)
+    top_bonus = p.get("top_n_bonus", 10.0)
+    bottom_n = p.get("bottom_n", 3)
+    bottom_penalty = p.get("bottom_n_penalty", -5.0)
+
     for sr in sector_ranks:
         if sr.sector_name == sector_name:
-            if sr.rank <= 3:
-                return 10.0
-            if sr.rank >= total_sectors - 2:
-                return -5.0
+            if sr.rank <= top_n:
+                return float(top_bonus)
+            if sr.rank >= total_sectors - bottom_n + 1:
+                return float(bottom_penalty)
             return 0.0
 
     return 0.0

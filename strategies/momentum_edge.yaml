@@ -1,0 +1,581 @@
+# MomentumEdge Strategy Configuration
+# Version bumps on param changes. Git history is version control.
+# Comments mark LOCKED (research-backed, do not sweep) vs FREE (backtest-tunable).
+
+meta:
+  name: "MomentumEdge"
+  version: "16.0.0"
+  description: "4-phase exit engine, 8 hard blocks, monster detection, configurable strategy"
+
+# ─── Universe Filters (Hard Blocks) ───────────────────────────────
+universe:
+  hard_blocks:
+    - name: market_cap_band
+      enabled: true
+      function: check_market_cap
+      params:
+        min_cr: 1000          # FREE: test 1000/1500/2000
+        max_cr: 30000
+
+    - name: liquidity
+      enabled: true
+      function: check_liquidity
+      params:
+        min_daily_traded_value_cr: 15  # FREE: test 10/15/20
+
+    - name: surveillance
+      enabled: true
+      function: check_asm_esm
+
+    - name: eps_junk
+      enabled: true
+      function: check_eps_junk
+      params:
+        min_positive_quarters: 2
+        lookback_quarters: 4
+
+    - name: ocf_quality
+      enabled: true
+      function: check_ocf
+      params:
+        max_negative_quarters: 3
+        lookback_quarters: 4
+
+    - name: promoter_pledge
+      enabled: true
+      function: check_pledge
+      params:
+        threshold_operational: 0.20
+        threshold_infra: 0.50
+        infra_exception:
+          de_falling: true
+          revenue_growth_min: 0.30
+
+    - name: sebi_fine
+      enabled: true
+      function: check_sebi_fine
+      params:
+        lookback_months: 24
+
+    - name: ipo_age
+      enabled: true
+      function: check_ipo_age
+      params:
+        min_trading_days: 200
+
+    - name: business_pivot
+      enabled: false          # Data source TBD — stubbed
+      function: check_business_pivot
+      params:
+        max_pivots: 3
+        lookback_years: 5
+
+# ─── Indicators ──────────────────────────────────────────────────
+indicators:
+  ma_periods: [50, 150, 200]
+  ma_slope_lookback: 20       # days for MA200 slope
+  atr_period: 14
+  momentum:
+    lookback_3m: 63
+    lookback_6m: 126
+    lookback_12m: 252
+    skip_1m: 21
+  volatility:
+    vol_target_pct: 20.0      # LOCKED (Barroso 2015)
+    vol_scalar_max: 2.0       # LOCKED
+    vol_lookback: 20
+  momentum_quality:
+    weekly_lookback: 26
+  rs:
+    lookback_days: 126        # 6-month relative strength
+  ad_ratio:
+    lookback_days: 20
+  volume_ratios:
+    short_period: 20
+    long_period: 50
+  week_52:
+    lookback_days: 252
+  factor_weights:
+    mom_3m: 0.20
+    mom_6m: 0.30
+    mom_12_1: 0.25
+    mom_quality: 0.15
+    rs_score: 0.10
+
+# ─── Scoring Modules ──────────────────────────────────────────────
+scoring:
+  composite_method: weighted_sum
+
+  modules:
+    - name: momentum
+      enabled: true
+      weight: 0.35
+      description: "Percentile-ranked momentum with vol scaling"
+      # Momentum score comes from indicators (scaled_score)
+      # No separate params needed — indicators config above drives it
+
+    - name: fundamental_bonus
+      enabled: true
+      weight: 0.20
+      params:
+        score_range: [-20, 30]    # v16 expanded from [-5, 20]
+        bonuses:
+          - signal: eps_acceleration
+            points: 8              # LOCKED
+            condition: "3 quarters of rising YoY EPS growth"
+          - signal: eps_growth_high
+            points: 5              # LOCKED
+            condition: "latest quarter EPS growth >= 15%"
+          - signal: eps_positive
+            points: 2              # LOCKED
+            condition: "latest quarter EPS growth >= 0%"
+          - signal: analyst_revision
+            points: 4              # LOCKED
+            condition: "upward EPS revision"
+          - signal: revenue_opm_simultaneous
+            points: 12
+            condition: "revenue growth > 20% AND OPM expanding > 300bp"
+          - signal: revenue_acceleration
+            points: 10
+            condition: "revenue growth > 30% YoY"
+          - signal: opm_expansion
+            points: 8
+            condition: "OPM expanding > 300bp over 3 quarters"
+          - signal: promoter_buying
+            points: 8
+            condition: "promoter open market purchases in last 2 quarters"
+          - signal: pead_sue_strong
+            points: 10
+            condition: "eps_growth_yoy > 50% reported within last 60 days"
+          - signal: pead_sue_moderate
+            points: 6
+            condition: "eps_growth_yoy > 25% reported within last 60 days"
+          - signal: market_cap_crossing
+            points: 6
+            condition: "entered market cap band within last 60 days"
+          - signal: low_de
+            points: 2              # LOCKED
+            condition: "D/E < 1.5 and not financial"
+          - signal: low_de_strong
+            points: 3              # LOCKED
+            condition: "D/E < 1.0 and not financial"
+          - signal: low_de_moderate
+            points: 1
+            condition: "D/E < 2.0 and not financial"
+        penalties:
+          - signal: high_de
+            points: -2             # LOCKED
+            condition: "D/E > 3.0"
+          - signal: promoter_selling
+            points: -8
+            condition: "promoter selling in last 2 quarters"
+          - signal: sebi_investigation
+            points: -10
+            condition: "active SEBI price investigation"
+          - signal: lodr_fine
+            points: -3
+            condition: "LODR fine in last 12 months"
+          - signal: debtors_critical
+            points: -5
+            condition: "trade receivable days > 180"
+          - signal: debtors_warning
+            points: -3
+            condition: "trade receivable days > 120"
+          - signal: ocf_quality_poor
+            points: -5
+            condition: "OCF/net profit < 0.4 for 2 consecutive quarters"
+
+    - name: accumulation
+      enabled: true
+      weight: 0.15
+      params:
+        obv_bonus: 5
+        ad_ratio_threshold: 0.60
+        ad_ratio_bonus: 4
+        inst_flow_bonus: 1         # Reduced from 2 in v16
+        inst_flow_routing:
+          low_promoter_threshold: 0.65
+          high_promoter_threshold: 0.75
+
+    - name: sector
+      enabled: true
+      weight: 0.10
+      params:
+        top_n: 3
+        top_n_bonus: 10
+        bottom_n: 3
+        bottom_n_penalty: -5
+        ranking_method: median_3m_momentum
+
+    - name: technical
+      enabled: true
+      weight: 0.12
+      params:
+        conditions:
+          price_above_ma50: true
+          price_above_ma150: true
+          price_above_ma200: true
+          ma50_above_ma150: true
+          ma150_above_ma200: true
+          ma200_slope_rising: true
+          near_52w_high_pct: 0.80
+          stage2_min_days: 20
+        base_score_max: 12.0
+        proximity_bonus_max: 3.0
+        technical_score_max: 15.0
+
+    - name: breakout
+      enabled: true
+      weight: 0.08
+      params:
+        vcp:
+          min_contractions: 3      # FREE: test 2/3/4
+          max_depth_pct: 40.0      # FREE: test 30/40/50
+          min_base_days: 25        # LOCKED (~5 weeks)
+          max_base_days: 260       # LOCKED (~52 weeks)
+          breakout_vol_ratio: 1.5  # FREE: test 1.25/1.5/2.0
+        entry_rules:
+          max_gap_above_pivot: 0.03
+          min_close_strength: 0.75
+          max_extension_above_pivot: 0.05
+          volume_confirmation: true
+          false_breakout_days: 2
+          earnings_window_days: 10
+
+# ─── Market Regime ────────────────────────────────────────────────
+regime:
+  signals:
+    - name: nifty_above_200ma
+      description: "Nifty close > 200-day MA"
+      weight: 1.0
+    - name: ma200_slope
+      description: "200-day MA slope rising"
+      weight: 1.0
+    - name: breadth_50ma
+      description: "% stocks above 50-day MA"
+      thresholds:
+        bull: 60
+        bear: 40
+    - name: highs_vs_lows
+      description: "52-week highs vs lows ratio"
+    - name: nifty_extension
+      description: "Nifty distance from 200MA"
+      thresholds:
+        sweet_spot: 15
+        danger: 25
+    - name: momentum_12_1
+      description: "12-minus-1 month return positive"
+      weight: 1.0
+
+  crash_indicator:
+    return_2yr_threshold: -0.20
+    rally_1m_threshold: 0.10
+
+  stability_days: 3
+
+  classifications:
+    - name: strong_bull
+      score_range: [5.0, 6.0]
+      equity_pct: 100
+      max_positions: 15
+      risk_per_trade: 2.0
+      portfolio_heat: 6.0
+      exposure_label: "Aggressive"
+    - name: bull
+      score_range: [4.0, 5.0]
+      equity_pct: 80
+      max_positions: 12
+      risk_per_trade: 1.5
+      portfolio_heat: 5.0
+      exposure_label: "Growth"
+    - name: weak
+      score_range: [2.5, 4.0]
+      equity_pct: 50
+      max_positions: 8
+      risk_per_trade: 1.0
+      portfolio_heat: 4.0
+      exposure_label: "Moderate"
+    - name: bear
+      score_range: [1.0, 2.5]
+      equity_pct: 25
+      max_positions: 4
+      risk_per_trade: 0.5
+      portfolio_heat: 2.0
+      exposure_label: "Defensive"
+    - name: full_bear
+      score_range: [0.0, 1.0]
+      equity_pct: 0
+      max_positions: 0
+      risk_per_trade: 0.0
+      portfolio_heat: 0.0
+      exposure_label: "Exit All"
+
+  fast_crash:
+    enabled: true
+    rolling_window_days: 5
+    decline_threshold: -0.08
+    response: sell_50_pct_all
+    reset_lookback_days: 10
+    overrides_monster: true
+
+  bull_entry_protocol:
+    enabled: true
+    phases:
+      - name: capitulation
+        trigger: "panic volume > 2x 20d avg on Nifty500 AND A/D higher low while price lower low"
+        capital_deploy: 0.0
+      - name: breadth_thrust
+        trigger: "single day 90%+ advancing volume"
+        capital_deploy: 0.25
+      - name: ad_confirmation
+        trigger: "A/D line higher high than capitulation"
+        capital_deploy: 0.25
+      - name: new_highs_expand
+        trigger: "52w highs > 100/week for 2+ weeks"
+        capital_deploy: null  # Uses regime allocation
+
+# ─── Exit Engine ──────────────────────────────────────────────────
+exits:
+  framework: phase_based
+
+  phases:
+    - name: prove_it
+      gain_range: [0.0, 0.25]
+      rules:
+        - type: fixed_stop
+          stop_pct: 0.08           # FREE: test 0.06/0.08/0.10
+          description: "8% stop from entry"
+        - type: regime_exit
+          trigger: bear_or_crash
+          action: sell_20pct_per_day
+          days: 5
+
+    - name: let_it_run
+      gain_range: [0.25, 1.0]
+      rules:
+        - type: trailing_stop
+          trail_pct: 0.20          # FREE: test 0.15/0.20/0.25
+          reference: 10_week_high
+        - type: rs_decay
+          floor_pct: 30
+          persist_weeks: 4         # LOCKED
+        - type: ma_weakness
+          ma_period: 21
+          confirm_days: 3
+          volume_check: true
+          trend_integrity_override: true
+        - type: climax_run
+          gain_threshold: 0.20
+          time_window_days: 15
+          sell_pct: 0.50
+        - type: regime_exit
+          trigger: bear_or_crash
+          action: sell_20pct_per_day
+          days: 5
+
+    - name: working_compounder
+      gain_range: [1.0, 2.0]
+      rules:
+        - type: trailing_stop
+          trail_pct: 0.15          # FREE: test 0.12/0.15/0.18
+          reference: 10_week_high
+        - type: rs_decay
+          floor_pct: 30
+          persist_weeks: 4
+        - type: ma_weakness
+          ma_period: 21
+          confirm_days: 3
+          volume_check: true
+          trend_integrity_override: true
+        - type: climax_run
+          gain_threshold: 1.00
+          time_window_days: 15
+          sell_pct: 0.50
+        - type: regime_exit
+          trigger: bear_or_crash
+          action: sell_20pct_per_day
+          days: 5
+
+    - name: monster_run
+      gain_range: [2.0, null]
+      rules:
+        - type: ma_breach
+          ma_period: 50            # 10-week MA, LOCKED
+          primary: true
+        - type: trailing_stop
+          trail_pct: 0.12          # FREE
+          reference: 10_week_high
+          applies_to: core_50pct
+        - type: partial_exit
+          at_new_highs: true
+          sell_pct: 0.25
+          max_partials: 2
+        - type: rs_decay
+          floor_pct: 30
+          persist_weeks: 4
+        - type: climax_run
+          gain_threshold: 1.00
+          time_window_days: 15
+          sell_pct: 0.50
+
+  validation_layers:
+    - name: trend_integrity
+      enabled: true
+      description: "Higher highs + higher lows intact -> suppress 21DMA warning"
+    - name: volume_direction
+      enabled: true
+      params:
+        hold_threshold: 0.75
+        distribution_threshold: 1.50
+        distribution_exit_pct: 0.25
+    - name: atr_compression
+      enabled: true
+      params:
+        compression_ratio: 0.70
+
+  cascade:
+    enabled: true
+    layers:
+      - name: climax_detection
+        priority: 1
+        trigger:
+          gain_threshold: 0.80
+          time_window_days: 15
+          surge_pct: 0.30
+        response:
+          sell_25_pct_immediate: true
+          sell_25_pct_next_high: true
+          sell_rest_below_10dma: true
+      - name: distribution_days
+        priority: 2
+        trigger:
+          index_decline_pct: 0.002
+          lookback_days: 25
+        response:
+          count_3_4: tighten_stops
+          count_5: reduce_25_pct
+          count_6: reduce_to_50_pct
+      - name: ad_divergence
+        priority: 3
+        trigger: "index new high AND A/D lower high"
+        response: reduce_all_25_pct
+      - name: new_highs_collapse
+        priority: 4
+        trigger: "Nifty500 new 52w highs count"
+        response:
+          below_50: trail_15_pct
+          below_20: reduce_to_50_pct
+      - name: tiered_trailing
+        priority: 5
+        trigger: "per-position gain-based trailing"
+        response: phase_dependent_trail
+
+# ─── Monster Stock Detection ─────────────────────────────────────
+monster:
+  enabled: true
+  score_threshold: 80              # LOCKED
+  gain_gate: 0.40                  # LOCKED — must have 40% gain to activate
+  criteria:
+    - signal: rs_rank_elite
+      points: 25
+      condition: "RS rank >= 90th percentile"
+    - signal: consolidation_count
+      points: 20
+      condition: "3+ prior institutional accumulation bases"
+    - signal: momentum_quality
+      points: 20
+      condition: "70%+ of weekly closes positive"
+    - signal: sector_leader
+      points: 15
+      condition: "sector rank = #1"
+    - signal: eps_acceleration_sustained
+      points: 10
+      condition: "EPS acceleration 4+ consecutive quarters"
+    - signal: base_depth_contracting
+      points: 10
+      condition: "each successive base shallower than prior"
+    - signal: sector_outperformance
+      points: 10
+      condition: "sector outperformance >= 2x over 6 months"
+
+# ─── Turnaround Watch ────────────────────────────────────────────
+turnaround_watch:
+  enabled: true
+  conditions:
+    min_negative_quarters: 2
+    lookback_quarters: 8
+    monotonic_improvement_quarters: 4
+    latest_eps_positive: true
+    min_revenue_growth_yoy: 0.10
+  suppression:
+    - "pledge > threshold"
+    - "SEBI fine active"
+    - "business pivots >= 3 in 5 years"
+    - "OCF negative 3+ of 4 quarters"
+
+# ─── Position Sizing ─────────────────────────────────────────────
+position_sizing:
+  base_risk_pct: 1.0               # FREE: update after backtest
+  position_floor_pct: 2.0
+  position_ceiling_pct: 20.0
+  max_sector_concentration: 0.30
+
+  adjustments:
+    - name: beta_reduction
+      enabled: true
+      condition: "beta > 2.5"
+      reduction: 0.40
+    - name: thin_float
+      enabled: true
+      condition: "promoter > 75% AND not PSU"
+      reduction: 0.40
+      additional: "require confirmed bulk deal"
+    - name: correlation
+      enabled: true
+      threshold_high: 0.85
+      threshold_moderate: 0.70
+      reduction_high: 0.50
+      reduction_moderate: 0.25
+      lookback_days: 60
+      min_overlap_days: 30
+
+# ─── Signal Lifecycle ────────────────────────────────────────────
+signals:
+  confirmation:
+    method: close_above_pivot
+    max_gap_pct: 0.03
+  tiering:
+    tier_1:
+      score_min: 75.0
+      regimes: ["Strong Bull", "Bull"]
+      breakout_required: true
+    tier_2:
+      score_min: 65.0
+    tier_3:
+      score_min: 55.0
+      or_earnings_within_days: 10
+  earnings_window_days: 10
+
+# ─── Backtest Configuration ──────────────────────────────────────
+backtest:
+  transaction_costs:
+    entry_slippage: 0.005
+    exit_slippage: 0.005
+    brokerage_per_side: 0.001
+    stt_sell: 0.001
+    exchange_per_side: 0.0005
+  periods:
+    in_sample: ["2010-01-01", "2022-12-31"]
+    out_of_sample: ["2023-01-01", "2024-12-31"]
+  initial_capital: 10000000        # Rs 1 crore
+  rebalance_frequency: monthly
+
+# ─── Pipeline Configuration ──────────────────────────────────────
+pipeline:
+  schedule: "0 11 * * 1-5"        # 4:30 PM IST (UTC)
+  timeout_minutes: 60
+  data_quality:
+    max_missing_stocks_pct: 5
+  notifications:
+    on_success: [email]
+    on_failure: [email]

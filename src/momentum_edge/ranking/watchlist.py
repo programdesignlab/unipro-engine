@@ -20,6 +20,7 @@ def generate_watchlist(
     target_date: date,
     regime: str,
     sector_ranks: list | None = None,
+    strategy=None,
 ) -> int:
     """
     Generate watchlist from scores table for target_date.

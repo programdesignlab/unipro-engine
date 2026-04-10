@@ -291,21 +291,55 @@ def _apply_stability_rule(
         return raw_regime
 
 
+# ── Nifty data loader ─────────────────────────────────────────────────────────
+
+
+def _load_nifty_from_db(db: Session, target_date: date):
+    """Load Nifty 50 index data from DB (eod_prices via stock symbol)."""
+    import pandas as pd
+
+    nifty_stock = (
+        db.execute(
+            text("""
+                SELECT id FROM stocks
+                WHERE symbol IN ('NIFTY 50', '^NSEI', 'NIFTY50')
+                LIMIT 1
+            """)
+        ).fetchone()
+    )
+
+    if not nifty_stock:
+        logger.warning("[M2] No Nifty 50 stock entry found in DB")
+        return pd.DataFrame()
+
+    rows = db.execute(
+        text("""
+            SELECT date, close FROM eod_prices
+            WHERE stock_id = :stock_id AND date <= :target_date
+            ORDER BY date
+        """),
+        {"stock_id": nifty_stock[0], "target_date": target_date},
+    ).fetchall()
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows, columns=["date", "close"])
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 
-def classify_regime(db: Session, target_date: date) -> RegimeResult:
+def classify_regime(db: Session, target_date: date, strategy=None) -> RegimeResult:
     """
-    Classify market regime for a given date (v7).
+    Classify market regime for a given date.
 
     Requires:
-      - Nifty 50 index data in parquet (504+ trading days ideal)
+      - Nifty 50 index data in DB (504+ trading days ideal)
       - indicators table populated for target_date
       - eod_prices table populated for target_date
     """
-    from momentum_edge.data.parquet_store import read_nifty_index
-
-    nifty = read_nifty_index()
+    nifty = _load_nifty_from_db(db, target_date)
 
     if nifty.empty or len(nifty) < 200:
         logger.warning(

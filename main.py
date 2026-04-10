@@ -234,7 +234,8 @@ def ingest(target_date):
 
 @cli.command()
 @click.option("--date", "target_date", default=None, help="Target date YYYY-MM-DD (default: last trading day)")
-def run(target_date):
+@click.option("--strategy", "strategy_path", default=None, help="Path to strategy YAML (default: strategies/momentum_edge.yaml)")
+def run(target_date, strategy_path):
     """Run the full pipeline (M1 → M10) for a trading day."""
     from momentum_edge.pipeline.runner import run_pipeline
     from momentum_edge.utils.date_utils import prev_trading_day
@@ -244,7 +245,7 @@ def run(target_date):
 
     console.print(Panel(f"[bold]Running pipeline for {d}[/bold]", expand=False))
     try:
-        run_pipeline(db, d)
+        run_pipeline(db, d, strategy_path=strategy_path)
         console.print(f"[green]✓[/green] Pipeline complete")
     except Exception as e:
         console.print(f"[red]✗ Pipeline failed:[/red] {e}")

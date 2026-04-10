@@ -6,7 +6,9 @@ import pandas as pd
 import yfinance as yf
 from loguru import logger
 
-from momentum_edge.data.parquet_store import append_nifty_index
+def append_nifty_index(df):
+    """Legacy parquet store stub — no-op."""
+    pass
 
 NIFTY50_TICKER = "^NSEI"
 

@@ -200,8 +200,8 @@ def _compute_stock_indicators(
 # Cross-sectional ranking & scoring
 # ---------------------------------------------------------------------------
 
-# Momentum factor weights for raw_score (percentile-ranked inputs)
-_FACTOR_WEIGHTS = {
+# Default momentum factor weights (overridden by strategy YAML)
+_DEFAULT_FACTOR_WEIGHTS = {
     "mom_3m": 0.20,
     "mom_6m": 0.30,
     "mom_12_1": 0.25,
@@ -210,7 +210,10 @@ _FACTOR_WEIGHTS = {
 }
 
 
-def _compute_ranks_and_scores(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _compute_ranks_and_scores(
+    results: list[dict[str, Any]],
+    factor_weights: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
     """
     Given a list of per-stock indicator dicts, compute cross-sectional:
       - rs_rank: percentile rank of rs_score (1 = best / highest RS)
@@ -219,6 +222,8 @@ def _compute_ranks_and_scores(results: list[dict[str, Any]]) -> list[dict[str, A
     """
     if not results:
         return results
+
+    weights = factor_weights or _DEFAULT_FACTOR_WEIGHTS
 
     df = pd.DataFrame(results)
 
@@ -236,7 +241,7 @@ def _compute_ranks_and_scores(results: list[dict[str, Any]]) -> list[dict[str, A
 
     # --- Percentile ranks for momentum factors ---
     pct_ranks = {}
-    for factor in _FACTOR_WEIGHTS:
+    for factor in weights:
         col = df[factor]
         valid = col.notna()
         if valid.sum() > 1:
@@ -249,7 +254,7 @@ def _compute_ranks_and_scores(results: list[dict[str, Any]]) -> list[dict[str, A
     # --- raw_score: weighted sum of percentile ranks (0–1 scale) ---
     raw_scores = pd.Series(0.0, index=df.index)
     total_weight = pd.Series(0.0, index=df.index)
-    for factor, weight in _FACTOR_WEIGHTS.items():
+    for factor, weight in weights.items():
         pct = pct_ranks[factor].reindex(df.index)
         valid = pct.notna()
         raw_scores[valid] += pct[valid] * weight
@@ -273,7 +278,11 @@ def _compute_ranks_and_scores(results: list[dict[str, Any]]) -> list[dict[str, A
 # ---------------------------------------------------------------------------
 
 
-def compute_and_store_indicators(db: Session, target_date: date) -> int:
+def compute_and_store_indicators(
+    db: Session,
+    target_date: date,
+    strategy=None,
+) -> int:
     """
     Compute all v7 technical indicators for every active stock and upsert into
     the indicators table.
@@ -378,7 +387,10 @@ def compute_and_store_indicators(db: Session, target_date: date) -> int:
         return 0
 
     # --- 5. Cross-sectional ranks & scores ---
-    results = _compute_ranks_and_scores(results)
+    factor_weights = None
+    if strategy is not None:
+        factor_weights = strategy.indicators.factor_weights
+    results = _compute_ranks_and_scores(results, factor_weights=factor_weights)
 
     # --- 6. Bulk upsert ---
     _upsert_indicators(db, results)
@@ -415,21 +427,6 @@ def _load_nifty_6m_return(db: Session, target_date: date) -> float:
             nifty_close_now = nifty_prices[-1][1]
             nifty_close_6m = nifty_prices[-126][1]
             return (nifty_close_now / nifty_close_6m - 1) * 100
-
-    # Fallback: try parquet
-    try:
-        from momentum_edge.data.parquet_store import read_nifty_index
-
-        nifty = read_nifty_index()
-        if not nifty.empty:
-            nifty = nifty.sort_values("date")
-            nifty = nifty[nifty["date"] <= pd.Timestamp(target_date)]
-            if len(nifty) >= 126:
-                close_now = nifty["close"].iloc[-1]
-                close_6m = nifty["close"].iloc[-126]
-                return (close_now / close_6m - 1) * 100
-    except Exception:
-        logger.debug("Parquet Nifty data unavailable; RS score will use 0 baseline")
 
     logger.warning("No Nifty 50 data found for RS calculation — using 0% baseline")
     return 0.0

@@ -1,19 +1,19 @@
 """
-Backtesting engine for MomentumEdge v7.
+Backtesting engine for MomentumEdge — strategy-driven.
 
 Simulates the daily pipeline over historical data:
 - Loads all price data upfront from DB
 - Iterates day-by-day, computing indicators and signals
 - Tracks portfolio: cash, positions, equity curve
 - Enforces realistic execution: next-day open, slippage, costs
-
-Adapted from quant-research POC backtester.
+- Reads all params from StrategyConfig (transaction costs, sizing, exits, momentum weights)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -24,17 +24,6 @@ from sqlalchemy.orm import Session
 
 from momentum_edge.db.models import BacktestResult, PerformanceLog, Stock
 
-# ---------------------------------------------------------------------------
-# Transaction cost model (v7 spec)
-# ---------------------------------------------------------------------------
-
-SLIPPAGE_ENTRY_PCT = 0.005  # +0.5% on entry
-SLIPPAGE_EXIT_PCT = 0.005  # -0.5% on exit
-BROKERAGE_PCT = 0.001  # 0.1% per side
-STT_SELL_PCT = 0.001  # 0.1% on sell
-EXCHANGE_PCT = 0.0005  # 0.05% per side
-# Total round trip: ~0.4%
-
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -43,7 +32,7 @@ EXCHANGE_PCT = 0.0005  # 0.05% per side
 
 @dataclass
 class BacktestConfig:
-    """Configuration for a backtest run."""
+    """Configuration for a backtest run. Reads defaults from StrategyConfig if provided."""
 
     start_date: date
     end_date: date
@@ -53,15 +42,63 @@ class BacktestConfig:
     max_position_pct: float = 0.20
     max_portfolio_heat_pct: float = 0.06
     max_sector_concentration_pct: float = 0.30
-    # v7 momentum weights (tuned by Test 1)
+    # Momentum weights (from strategy YAML)
     mom_weight_12_1: float = 0.40
     mom_weight_6m: float = 0.35
     mom_weight_3m: float = 0.25
-    # Strategy toggles (for A/B testing)
+    # Strategy toggles
     use_trend_template: bool = True
     use_fundamental_bonus: bool = True
     use_vol_scaling: bool = True
     use_regime_filter: bool = True
+    # Transaction costs (from strategy YAML)
+    slippage_entry_pct: float = 0.005
+    slippage_exit_pct: float = 0.005
+    brokerage_pct: float = 0.001
+    stt_sell_pct: float = 0.001
+    exchange_pct: float = 0.0005
+    # v16 exit framework
+    use_phase_exits: bool = False  # True = v16 4-phase, False = v7 flat rules
+    # Strategy path (for loading full config)
+    strategy_path: str | None = None
+
+    @classmethod
+    def from_strategy(
+        cls,
+        start_date: date,
+        end_date: date,
+        strategy_path: str | Path = "strategies/momentum_edge.yaml",
+    ) -> "BacktestConfig":
+        """Create BacktestConfig populated from a strategy YAML file."""
+        from momentum_edge.core.strategy import load_strategy
+
+        s = load_strategy(strategy_path)
+        tc = s.backtest.transaction_costs
+        fw = s.indicators.factor_weights
+
+        # Find max positions from highest regime classification
+        max_pos = max((c.max_positions for c in s.regime.classifications), default=15)
+
+        return cls(
+            start_date=start_date,
+            end_date=end_date,
+            initial_capital=s.backtest.initial_capital,
+            max_positions=max_pos,
+            risk_per_trade_pct=s.position_sizing.base_risk_pct,
+            max_position_pct=s.position_sizing.position_ceiling_pct / 100,
+            max_portfolio_heat_pct=max((c.portfolio_heat for c in s.regime.classifications), default=6.0) / 100,
+            max_sector_concentration_pct=s.position_sizing.max_sector_concentration,
+            mom_weight_12_1=fw.get("mom_12_1", 0.25) / (fw.get("mom_12_1", 0.25) + fw.get("mom_6m", 0.30) + fw.get("mom_3m", 0.20)),
+            mom_weight_6m=fw.get("mom_6m", 0.30) / (fw.get("mom_12_1", 0.25) + fw.get("mom_6m", 0.30) + fw.get("mom_3m", 0.20)),
+            mom_weight_3m=fw.get("mom_3m", 0.20) / (fw.get("mom_12_1", 0.25) + fw.get("mom_6m", 0.30) + fw.get("mom_3m", 0.20)),
+            slippage_entry_pct=tc.entry_slippage,
+            slippage_exit_pct=tc.exit_slippage,
+            brokerage_pct=tc.brokerage_per_side,
+            stt_sell_pct=tc.stt_sell,
+            exchange_pct=tc.exchange_per_side,
+            use_phase_exits=s.exits.framework == "phase_based",
+            strategy_path=str(strategy_path),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +352,13 @@ class Backtester:
 
     def _apply_entry_cost(self, price: float) -> float:
         """Apply slippage + brokerage to entry price."""
-        return price * (1 + SLIPPAGE_ENTRY_PCT + BROKERAGE_PCT + EXCHANGE_PCT)
+        cfg = self.config
+        return price * (1 + cfg.slippage_entry_pct + cfg.brokerage_pct + cfg.exchange_pct)
 
     def _apply_exit_cost(self, price: float) -> float:
         """Apply slippage + brokerage + STT to exit price."""
-        return price * (1 - SLIPPAGE_EXIT_PCT - BROKERAGE_PCT - STT_SELL_PCT - EXCHANGE_PCT)
+        cfg = self.config
+        return price * (1 - cfg.slippage_exit_pct - cfg.brokerage_pct - cfg.stt_sell_pct - cfg.exchange_pct)
 
     # ------------------------------------------------------------------
     # Price helpers (no look-ahead)
@@ -568,18 +607,24 @@ class Backtester:
         Calculate number of shares using the 2% risk rule with regime adjustment.
         Returns share count or None if position is invalid.
         """
-        from momentum_edge.engine.position_sizing import (
-            REGIME_RISK_MAP,
-            POSITION_FLOOR_PCT,
-            POSITION_CEILING_PCT,
-        )
+        from momentum_edge.engine.position_sizing import get_regime_risk_pct
 
         risk_per_share = entry_price - stop_loss
         if risk_per_share <= 0:
             return None
 
         equity = self._compute_equity_fast()
-        risk_pct = REGIME_RISK_MAP.get(regime, 0.5)
+
+        # Load strategy if available for regime-aware sizing
+        strategy = None
+        if self.config.strategy_path:
+            try:
+                from momentum_edge.core.strategy import load_strategy
+                strategy = load_strategy(self.config.strategy_path)
+            except Exception:
+                pass
+
+        risk_pct = get_regime_risk_pct(regime, strategy=strategy)
         if risk_pct <= 0:
             return None
 
@@ -592,13 +637,16 @@ class Backtester:
         position_value = shares * entry_price
         position_pct = (position_value / equity) * 100.0
 
+        floor_pct = self.config.risk_per_trade_pct  # use as floor proxy
+        ceiling_pct = self.config.max_position_pct * 100
+
         # Floor check
-        if position_pct < POSITION_FLOOR_PCT:
+        if position_pct < floor_pct:
             return None
 
         # Ceiling cap
-        if position_pct > POSITION_CEILING_PCT:
-            max_value = equity * (POSITION_CEILING_PCT / 100.0)
+        if position_pct > ceiling_pct:
+            max_value = equity * (ceiling_pct / 100.0)
             shares = int(max_value / entry_price)
 
         # Cash check
@@ -744,8 +792,8 @@ class Backtester:
 
     def _check_exits(self, current_date: date) -> None:
         """
-        Check all exit rules for open positions.
-        Simplified version of the 9-rule exit engine for backtest speed.
+        Check exit rules for open positions.
+        Uses v16 phase-based exits if configured, otherwise v7 flat rules.
         """
         to_close: list[tuple[int, str]] = []  # (position_index, reason)
 
@@ -790,21 +838,39 @@ class Backtester:
                 to_close.append((idx, "climax_top"))
                 continue
 
-            # --- Trailing stop management ---
+            # --- Trailing stop management (v16 phase-based or v7 flat) ---
             if ind:
                 high_10d = ind["high_10d"]
+                gain_frac = gain_pct / 100.0  # convert to fraction for phase comparison
 
-                # Rule 6: gain >= 100% → trail 15% below 10d high
-                if gain_pct >= 100:
-                    new_stop = high_10d * 0.85
-                    pos["current_stop"] = max(pos["current_stop"], new_stop)
-                # Rule 5: gain >= 40% → trail 10% below 10d high
-                elif gain_pct >= 40:
-                    new_stop = high_10d * 0.90
-                    pos["current_stop"] = max(pos["current_stop"], new_stop)
-                # Rule 4: gain >= 20% → move stop to entry (breakeven)
-                elif gain_pct >= 20:
-                    pos["current_stop"] = max(pos["current_stop"], entry_price)
+                if self.config.use_phase_exits:
+                    # v16 phase-based trailing
+                    if gain_frac >= 2.0:
+                        # Monster run: 12% trail
+                        new_stop = high_10d * 0.88
+                        pos["current_stop"] = max(pos["current_stop"], new_stop)
+                    elif gain_frac >= 1.0:
+                        # Working compounder: 15% trail
+                        new_stop = high_10d * 0.85
+                        pos["current_stop"] = max(pos["current_stop"], new_stop)
+                    elif gain_frac >= 0.25:
+                        # Let it run: 20% trail
+                        new_stop = high_10d * 0.80
+                        pos["current_stop"] = max(pos["current_stop"], new_stop)
+                    else:
+                        # Prove it: fixed 8% stop from entry
+                        fixed_stop = entry_price * 0.92
+                        pos["current_stop"] = max(pos["current_stop"], fixed_stop)
+                else:
+                    # v7 flat trailing rules
+                    if gain_pct >= 100:
+                        new_stop = high_10d * 0.85
+                        pos["current_stop"] = max(pos["current_stop"], new_stop)
+                    elif gain_pct >= 40:
+                        new_stop = high_10d * 0.90
+                        pos["current_stop"] = max(pos["current_stop"], new_stop)
+                    elif gain_pct >= 20:
+                        pos["current_stop"] = max(pos["current_stop"], entry_price)
 
         # Execute exits (reverse order to avoid index shift issues)
         for idx, reason in sorted(to_close, key=lambda x: x[0], reverse=True):

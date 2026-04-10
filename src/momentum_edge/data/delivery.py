@@ -17,7 +17,9 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from momentum_edge.db.models import Stock
-from momentum_edge.data.parquet_store import append_delivery
+def append_delivery(df):
+    """Legacy parquet store stub — no-op."""
+    pass
 
 
 def _fetch_delivery(symbol: str, from_date: date, to_date: date) -> pd.DataFrame:

@@ -31,7 +31,7 @@ def get_regime_signals(db: Session = Depends(get_db)):
 
     Computes signals from current indicator and price data.
     """
-    from momentum_edge.data.parquet_store import read_nifty_index
+    import pandas as pd
 
     # Get latest indicator date
     latest_date = db.execute(
@@ -41,10 +41,19 @@ def get_regime_signals(db: Session = Depends(get_db)):
     if not latest_date:
         return {"error": "No indicator data available"}
 
-    # S1: Nifty close vs 200MA
-    # S5: Extension from 200MA
-    # S6: Nifty 12-1 month return
-    nifty_df = read_nifty_index()
+    # Load Nifty from DB
+    nifty_stock = db.execute(
+        text("SELECT id FROM stocks WHERE symbol IN ('NIFTY 50', '^NSEI', 'NIFTY50') LIMIT 1")
+    ).fetchone()
+
+    if nifty_stock:
+        rows = db.execute(
+            text("SELECT date, close FROM eod_prices WHERE stock_id = :sid AND date <= :dt ORDER BY date"),
+            {"sid": nifty_stock[0], "dt": latest_date},
+        ).fetchall()
+        nifty_df = pd.DataFrame(rows, columns=["date", "close"]) if rows else pd.DataFrame()
+    else:
+        nifty_df = pd.DataFrame()
     nifty_close = None
     nifty_ma200 = None
     s1 = s2 = s5 = s6 = 0.0
