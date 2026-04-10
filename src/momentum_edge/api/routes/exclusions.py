@@ -49,3 +49,29 @@ def get_exclusions(
         }
     except Exception:
         return {"count": 0, "exclusions": [], "note": "exclusion_log table not yet created"}
+
+
+@router.get("/exclusions/summary")
+def get_exclusion_summary(db: Session = Depends(get_db)):
+    """Return exclusion counts by block name for the latest scan date."""
+    try:
+        rows = db.execute(
+            text("""
+                SELECT el.block_name, COUNT(*) AS count
+                FROM exclusion_log el
+                WHERE el.date = (SELECT MAX(date) FROM exclusion_log)
+                GROUP BY el.block_name
+                ORDER BY count DESC
+            """)
+        ).mappings().all()
+
+        total = sum(r["count"] for r in rows)
+        date_row = db.execute(text("SELECT MAX(date) FROM exclusion_log")).scalar()
+
+        return {
+            "date": str(date_row) if date_row else None,
+            "total_excluded": total,
+            "by_block": {r["block_name"]: r["count"] for r in rows},
+        }
+    except Exception:
+        return {"date": None, "total_excluded": 0, "by_block": {}}

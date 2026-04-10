@@ -101,6 +101,42 @@ def get_stock_detail(symbol: str, db: Session = Depends(get_db)):
         {"sid": stock_id},
     ).mappings().first()
 
+    # Monster score (if indicators available)
+    monster_data = None
+    if indicator:
+        try:
+            from momentum_edge.engine.monster import calculate_monster_score
+            from momentum_edge.core.strategy import load_strategy
+            strategy = load_strategy("strategies/momentum_edge.yaml")
+            result = calculate_monster_score(
+                db, stock_id, sym, indicator["date"],
+                config=strategy.monster,
+            )
+            monster_data = {
+                "score": result.score,
+                "meets_threshold": result.meets_threshold,
+                "components": result.components,
+            }
+        except Exception:
+            pass
+
+    # Exclusion reason (if stock was filtered out)
+    exclusion = db.execute(
+        text("""
+            SELECT block_name, reason, data_missing
+            FROM exclusion_log
+            WHERE stock_id = :sid
+            ORDER BY date DESC
+            LIMIT 1
+        """),
+        {"sid": stock_id},
+    ).mappings().first()
+
+    # Strategy hash from latest scores
+    strategy_hash = None
+    if score:
+        strategy_hash = score.get("strategy_hash")
+
     return {
         "stock": dict(stock),
         "latest_price": dict(price) if price else None,
@@ -108,4 +144,7 @@ def get_stock_detail(symbol: str, db: Session = Depends(get_db)):
         "scores": dict(score) if score else None,
         "fundamentals": [dict(f) for f in fundamentals],
         "watchlist": dict(watchlist_entry) if watchlist_entry else None,
+        "monster": monster_data,
+        "exclusion": dict(exclusion) if exclusion else None,
+        "strategy_hash": strategy_hash,
     }
