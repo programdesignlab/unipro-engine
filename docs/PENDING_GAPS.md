@@ -150,13 +150,62 @@ The pledge filter identifies infra stocks and applies a higher threshold (50% vs
 
 ---
 
+## Medium: `market_regime_log` Table Not Created
+
+`scanner/market_regime.py` line 264 queries `market_regime_log` for the stability rule (3-day regime persistence). This table was never created via migration — the code has a try/except that silently skips the stability rule when the table doesn't exist.
+
+**Fix:** Either create the table via Alembic migration, or store regime history in an existing table (e.g., `pipeline_log` or a new `regime_history` table).
+
+---
+
+## Low: `main.py scan` Command Not Updated
+
+The `scan` CLI command (line ~253 in main.py) imports `run_indicators` and `classify_regime` directly and runs a partial pipeline. It does not accept `--strategy` or load strategy YAML.
+
+**Fix:** Update `scan` command to accept `--strategy` and pass through to module calls.
+
+---
+
+## Low: Legacy `ScanResult` Model
+
+`db/models.py` still defines `ScanResult` (table `scan_results`) — marked as "Legacy scaffold table — superseded by scores + watchlist". Safe to remove.
+
+---
+
+## Low: Parquet Noop Stubs
+
+3 files have noop stub functions replacing the deleted `parquet_store` imports:
+- `data/prices.py` → `append_prices()`
+- `data/delivery.py` → `append_delivery()`
+- `data/nse_indices.py` → `append_nifty_index()`
+
+These are harmless but add dead code. Can be removed once all callers are cleaned up (the functions are called after DB writes, so removing them means removing those call sites too).
+
+---
+
+## Low: `.env.example` May Need v16 Vars
+
+`.env.example` exists but may not include `NEON_AUTH_BASE_URL` or document the strategy YAML path.
+
+**Fix:** Review and update `.env.example` with all current env vars.
+
+---
+
+## Low: 277KB v16 Spec in Archive
+
+`docs/archive/UniProAI_MomentumEdge_v16 (3).md` is 277KB. Consider adding to `.gitignore` or removing from git history if repo size matters.
+
+---
+
 ## Priority Order
 
 1. **Data ingestion (OCF, OPM storage, trade receivables)** — blocks 5 scoring signals
 2. **Wire 5 engine modules to pipeline** — blocks fast crash, monster, turnaround, cascade
 3. **Position lifecycle in pipeline** — blocks exit engine, gain phase display, monster override
-4. **Beta/PSU/SEBI data population** — blocks position sizing adjustments and filter accuracy
-5. **Cron strategy path fix** — trivial, do anytime
-6. **UI: gain phase + bull entry display** — after position lifecycle is active
-7. **Backtest updates** — after pipeline is fully wired
-8. **Cleanup** — composite_score.py, notes.md, old docs
+4. **Create `market_regime_log` table** — stability rule silently skipped without it
+5. **Beta/PSU/SEBI data population** — blocks position sizing adjustments and filter accuracy
+6. **Cron strategy path fix** — trivial, do anytime
+7. **UI: gain phase + bull entry display** — after position lifecycle is active
+8. **Backtest updates (test_runner, walkforward, sweep params)** — after pipeline is fully wired
+9. **Cleanup** — composite_score.py, ScanResult model, parquet stubs, notes.md, .env.example update
+10. **`main.py scan` command update** — accept --strategy flag
