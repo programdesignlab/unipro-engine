@@ -415,11 +415,11 @@ class ScreenerClient:
             if total_equity != 0:
                 result["debt_to_equity"] = round(borrowings / total_equity, 4)
 
-        # v16: Trade receivables (approximate row — search by label)
+        # v16: Trade receivables (row 66 = "Receivables")
         try:
-            for row_idx in range(_ROW_BS_BORROWINGS + 1, min(_ROW_BS_SHARES, len(df))):
+            for row_idx in range(_ROW_BS_BORROWINGS + 1, min(_ROW_BS_SHARES + 5, len(df))):
                 cell = str(df.iloc[row_idx, 0]).strip().lower()
-                if "trade receivable" in cell or "sundry debtor" in cell:
+                if cell in ("receivables", "trade receivables", "sundry debtors"):
                     trade_recv = _latest(df.iloc[row_idx, 1:])
                     if trade_recv is not None:
                         result["trade_receivables"] = trade_recv
@@ -427,11 +427,11 @@ class ScreenerClient:
         except Exception:
             pass
 
-        # v16: Cash from operating activities (search in cash flow section)
+        # v16: Cash from operating activities (row 81 area)
         try:
-            for row_idx in range(_ROW_CF_HEADER, min(_ROW_CF_HEADER + 20, len(df))):
+            for row_idx in range(70, min(90, len(df))):
                 cell = str(df.iloc[row_idx, 0]).strip().lower()
-                if "cash from operating" in cell or "operating activity" in cell:
+                if "cash from operating" in cell:
                     ocf = _latest(df.iloc[row_idx, 1:])
                     if ocf is not None:
                         result["ocf_cr"] = ocf
