@@ -587,7 +587,6 @@ def _update_stock_financial_flag(db: Session, stock: Stock) -> None:
             text("UPDATE stocks SET is_financial = :is_fin, updated_at = now() WHERE id = :sid"),
             {"is_fin": is_fin, "sid": stock.id},
         )
-        db.commit()
 
 
 def _update_stock_shareholding(db: Session, stock: Stock, latest: dict) -> None:
@@ -610,7 +609,6 @@ def _update_stock_shareholding(db: Session, stock: Stock, latest: dict) -> None:
             "sid": stock.id,
         },
     )
-    db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +654,8 @@ def sync_screener_fundamentals(
 
     total_fundamentals = 0
     total_shareholding = 0
+    all_fund_rows: list[dict] = []
+    all_sh_rows: list[dict] = []
 
     for idx, stock in enumerate(stocks):
         symbol = stock.symbol
@@ -734,26 +734,38 @@ def sync_screener_fundamentals(
                 "trade_receivables_days": trade_recv_days,
             })
 
-        written = _upsert_fundamentals(db, fund_rows)
-        total_fundamentals += written
+        total_fundamentals += len(fund_rows)
+        all_fund_rows.extend(fund_rows)
 
         # -- Parse and upsert shareholding ----------------------------------
         sh_records = client.parse_shareholding(symbol)
         if sh_records:
             sh_rows = [{"stock_id": stock.id, **r} for r in sh_records]
-            sh_written = _upsert_shareholding(db, sh_rows)
-            total_shareholding += sh_written
+            all_sh_rows.extend(sh_rows)
+            total_shareholding += len(sh_rows)
 
             # Update stocks table with latest shareholding
             latest_sh = sh_records[-1]
             _update_stock_shareholding(db, stock, latest_sh)
 
-        # -- Logging --------------------------------------------------------
-        if (idx + 1) % 10 == 0:
-            logger.info(f"  Progress: {idx + 1}/{len(stocks)} stocks processed")
+        # -- Batch commit every 50 stocks to limit memory + get checkpoints -
+        if (idx + 1) % 50 == 0:
+            if all_fund_rows:
+                _upsert_fundamentals(db, all_fund_rows)
+                all_fund_rows.clear()
+            if all_sh_rows:
+                _upsert_shareholding(db, all_sh_rows)
+                all_sh_rows.clear()
+            logger.info(f"  Progress: {idx + 1}/{len(stocks)} — batch committed")
 
         # Rate limiting — 3s to avoid Screener throttling
         time.sleep(3)
+
+    # Final flush — commit remaining accumulated rows
+    if all_fund_rows:
+        _upsert_fundamentals(db, all_fund_rows)
+    if all_sh_rows:
+        _upsert_shareholding(db, all_sh_rows)
 
     client.close()
     logger.info(
