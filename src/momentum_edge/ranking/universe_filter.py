@@ -182,12 +182,38 @@ def _check_pledge(db: Session, stock: Stock, as_of_date: date, params: dict) -> 
         return FilterResult(passes=True, fail_reason=None)
 
     # Check against thresholds
-    # TODO: implement infra exception (D/E falling + revenue growth > 30%)
     sector = stock.sector or ""
     is_infra = any(kw in sector.lower() for kw in ("infra", "power", "roads", "construction"))
 
     threshold = thresh_infra if is_infra else thresh_operational
     if pledge_pct > threshold:
+        # Infra exception: allow if D/E falling AND revenue growth > 30%
+        if is_infra:
+            infra_exc = params.get("infra_exception", {})
+            if infra_exc.get("de_falling") and infra_exc.get("revenue_growth_min"):
+                de_rows = db.execute(
+                    text("""
+                        SELECT debt_to_equity FROM fundamentals
+                        WHERE stock_id = :sid AND debt_to_equity IS NOT NULL
+                        ORDER BY quarter DESC LIMIT 2
+                    """),
+                    {"sid": stock.id},
+                ).fetchall()
+                rev_row = db.execute(
+                    text("""
+                        SELECT revenue_yoy_growth FROM fundamentals
+                        WHERE stock_id = :sid AND revenue_yoy_growth IS NOT NULL
+                        ORDER BY quarter DESC LIMIT 1
+                    """),
+                    {"sid": stock.id},
+                ).fetchone()
+
+                de_falling = len(de_rows) >= 2 and de_rows[0][0] < de_rows[1][0]
+                rev_strong = rev_row and rev_row[0] and rev_row[0] > infra_exc["revenue_growth_min"] * 100
+
+                if de_falling and rev_strong:
+                    return FilterResult(passes=True, fail_reason=None)  # exception granted
+
         return FilterResult(
             passes=False,
             fail_reason=f"pledge_{pledge_pct*100:.0f}pct_gt_{threshold*100:.0f}pct",

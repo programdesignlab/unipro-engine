@@ -25,7 +25,7 @@ def main():
 
     db = SessionLocal()
     try:
-        run_pipeline(db, target)
+        run_pipeline(db, target, strategy_path="strategies/momentum_edge.yaml")
 
         # Send email digest
         try:

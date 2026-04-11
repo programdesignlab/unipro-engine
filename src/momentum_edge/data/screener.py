@@ -57,6 +57,9 @@ _ROW_BS_RESERVES = 57
 _ROW_BS_BORROWINGS = 58
 _ROW_BS_SHARES = 69
 _ROW_BS_FACE_VALUE = 71
+# v16 additions — cash flow & balance sheet details
+_ROW_CF_HEADER = 73        # Cash Flow Statement section (approximate, may vary)
+_ROW_BS_TRADE_RECEIVABLES = 61  # Trade receivables row (approximate)
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +323,11 @@ class ScreenerClient:
             if net_profit is not None and sales and sales != 0:
                 net_margin = round(net_profit / sales * 100, 2)
 
+            # OPM (Operating Profit Margin %)
+            opm: float | None = None
+            if op_profit is not None and sales and sales != 0:
+                opm = round(op_profit / sales * 100, 2)
+
             records.append({
                 "quarter": quarter,
                 "period_end_date": period_end,
@@ -328,6 +336,7 @@ class ScreenerClient:
                 "operating_profit": op_profit,
                 "eps": eps,
                 "net_margin": net_margin,
+                "opm": opm,
             })
 
         # --- YoY growth calculations (same quarter, 4 quarters back) -------
@@ -405,6 +414,30 @@ class ScreenerClient:
             total_equity = equity + reserves
             if total_equity != 0:
                 result["debt_to_equity"] = round(borrowings / total_equity, 4)
+
+        # v16: Trade receivables (approximate row — search by label)
+        try:
+            for row_idx in range(_ROW_BS_BORROWINGS + 1, min(_ROW_BS_SHARES, len(df))):
+                cell = str(df.iloc[row_idx, 0]).strip().lower()
+                if "trade receivable" in cell or "sundry debtor" in cell:
+                    trade_recv = _latest(df.iloc[row_idx, 1:])
+                    if trade_recv is not None:
+                        result["trade_receivables"] = trade_recv
+                    break
+        except Exception:
+            pass
+
+        # v16: Cash from operating activities (search in cash flow section)
+        try:
+            for row_idx in range(_ROW_CF_HEADER, min(_ROW_CF_HEADER + 20, len(df))):
+                cell = str(df.iloc[row_idx, 0]).strip().lower()
+                if "cash from operating" in cell or "operating activity" in cell:
+                    ocf = _latest(df.iloc[row_idx, 1:])
+                    if ocf is not None:
+                        result["ocf_cr"] = ocf
+                    break
+        except Exception:
+            pass
 
         return result
 
@@ -493,11 +526,13 @@ def _upsert_fundamentals(db: Session, rows: list[dict]) -> int:
         text("""
             INSERT INTO fundamentals (
                 stock_id, quarter, eps, eps_yoy_growth, revenue, revenue_yoy_growth,
-                net_margin, debt_to_equity, is_financial, reporting_date
+                net_margin, debt_to_equity, is_financial, reporting_date,
+                opm, ocf_cr, trade_receivables_days
             )
             VALUES (
                 :stock_id, :quarter, :eps, :eps_yoy_growth, :revenue, :revenue_yoy_growth,
-                :net_margin, :debt_to_equity, :is_financial, :reporting_date
+                :net_margin, :debt_to_equity, :is_financial, :reporting_date,
+                :opm, :ocf_cr, :trade_receivables_days
             )
             ON CONFLICT (stock_id, quarter) DO UPDATE SET
                 eps               = EXCLUDED.eps,
@@ -508,6 +543,9 @@ def _upsert_fundamentals(db: Session, rows: list[dict]) -> int:
                 debt_to_equity    = EXCLUDED.debt_to_equity,
                 is_financial      = EXCLUDED.is_financial,
                 reporting_date    = EXCLUDED.reporting_date,
+                opm               = EXCLUDED.opm,
+                ocf_cr            = EXCLUDED.ocf_cr,
+                trade_receivables_days = EXCLUDED.trade_receivables_days,
                 updated_at        = now()
         """),
         rows,
@@ -661,9 +699,21 @@ def sync_screener_fundamentals(
         # -- Parse quarterly fundamentals -----------------------------------
         quarterly = client.parse_quarterly_fundamentals(symbol, excel_bytes)
 
-        # -- Parse balance sheet for D/E ------------------------------------
+        # -- Parse balance sheet for D/E + v16 fields -------------------------
         bs = client.parse_balance_sheet(excel_bytes)
         debt_to_equity = bs.get("debt_to_equity")
+        ocf_cr = bs.get("ocf_cr")
+        trade_receivables = bs.get("trade_receivables")
+
+        # Calculate trade receivable days: (receivables / annual_sales) * 365
+        trade_recv_days: float | None = None
+        if trade_receivables is not None and quarterly:
+            # Use most recent 4 quarters of sales for annualized revenue
+            recent_sales = [q.get("sales") for q in quarterly[:4] if q.get("sales")]
+            if recent_sales:
+                annual_sales = sum(recent_sales) * (4 / len(recent_sales))
+                if annual_sales > 0:
+                    trade_recv_days = round(trade_receivables / annual_sales * 365, 1)
 
         # -- Build DB rows --------------------------------------------------
         fund_rows: list[dict] = []
@@ -679,6 +729,9 @@ def sync_screener_fundamentals(
                 "debt_to_equity": debt_to_equity,
                 "is_financial": is_financial,
                 "reporting_date": q.get("period_end_date"),
+                "opm": q.get("opm"),
+                "ocf_cr": ocf_cr,
+                "trade_receivables_days": trade_recv_days,
             })
 
         written = _upsert_fundamentals(db, fund_rows)

@@ -351,83 +351,26 @@ def watchlist(target_date, top):
 
 @cli.command()
 @click.option("--date", "target_date", default=None, help="Target date YYYY-MM-DD (default: last trading day)")
-def scan(target_date):
-    """Run scan only (indicators + M2-M9 scoring) without data ingestion."""
-    from momentum_edge.pipeline.runner import run_indicators
-    from momentum_edge.scanner.market_regime import classify_regime
-    from momentum_edge.scanner.sector_rotation import rank_sectors, get_sector_score
-    from momentum_edge.scanner.trend_template import passes_trend_template
-    from momentum_edge.scanner.breakout_patterns import detect_pattern
-    from momentum_edge.ranking.momentum_score import score_momentum
-    from momentum_edge.ranking.canslim_score import apply_canslim_filter
-    from momentum_edge.ranking.accumulation_score import score_accumulation
-    from momentum_edge.ranking.composite_score import compute_composite
-    from momentum_edge.ranking.watchlist import generate_watchlist
-    from momentum_edge.db.models import Stock
+@click.option("--strategy", "strategy_path", default=None, help="Path to strategy YAML")
+def scan(target_date, strategy_path):
+    """Run scan only (indicators + scoring) without data ingestion.
+
+    Same as 'run' but skips M1 data ingestion step. Uses existing price data.
+    """
+    from momentum_edge.pipeline.runner import run_pipeline
     from momentum_edge.utils.date_utils import prev_trading_day
 
     d = date.fromisoformat(target_date) if target_date else prev_trading_day()
     db = _get_db()
 
-    console.print(Panel(f"[bold]Scanning for {d}[/bold]", expand=False))
+    console.print(Panel(f"[bold]Scanning for {d}[/bold] (skip data ingestion)", expand=False))
     try:
-        # Indicators
-        count = run_indicators(db, d)
-        console.print(f"[green]✓[/green] Indicators: {count} stocks")
-
-        # M2
-        regime_result = classify_regime(db, d)
-        console.print(
-            f"[green]✓[/green] Regime: [bold]{regime_result.regime.value}[/bold] "
-            f"({regime_result.exposure})"
-        )
-
-        # M3
-        sector_ranks = rank_sectors(db, d)
-        console.print(f"[green]✓[/green] Sectors ranked: {len(sector_ranks)}")
-
-        # M4-M9 for all stocks
-        stocks = db.query(Stock).filter(Stock.is_active == True).all()  # noqa: E712
-        scored = 0
-        trend_pass = 0
-
-        for stock in stocks:
-            mom = score_momentum(stock.symbol, d)
-            canslim = apply_canslim_filter(db, stock.id, stock.symbol)
-            sec_score = get_sector_score(sector_ranks, stock.sector)
-            trend = passes_trend_template(db, stock.id, stock.symbol, d)
-            accum = score_accumulation(db, stock.id, stock.symbol, d)
-
-            if trend.passes:
-                trend_pass += 1
-                pattern = detect_pattern(db, stock.id, stock.symbol, d)
-                brk_score = pattern.breakout_score
-            else:
-                brk_score = 0.0
-
-            compute_composite(
-                db, stock.id, d,
-                momentum_score=mom["total"],
-                fundamental_score=canslim.score if canslim.passes else 0.0,
-                sector_score=sec_score,
-                technical_score=trend.technical_score,
-                accumulation_score=accum["total"],
-                breakout_score=brk_score,
-            )
-            scored += 1
-
-        db.commit()
-        console.print(f"[green]✓[/green] Scored: {scored} stocks, {trend_pass} passed trend template")
-
-        # M10
-        wl_count = generate_watchlist(db, d, regime_result.regime.value, sector_ranks)
-        console.print(f"[green]✓[/green] Watchlist: {wl_count} stocks")
+        # Run full pipeline but it will use existing data
+        run_pipeline(db, d, strategy_path=strategy_path)
+        console.print(f"[green]✓[/green] Scan complete")
         console.print(f"\n[cyan]Run[/cyan] [bold]watchlist --date {d}[/bold] [cyan]to view results[/cyan]")
-
     except Exception as e:
         console.print(f"[red]✗ Scan failed:[/red] {e}")
-        import traceback
-        traceback.print_exc()
         sys.exit(1)
     finally:
         db.close()

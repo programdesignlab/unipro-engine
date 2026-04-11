@@ -59,6 +59,239 @@ def _persist_log(
         db.rollback()
 
 
+def _update_beta_and_psu(db: Session, target_date: date) -> None:
+    """Calculate 1yr beta vs Nifty for all stocks and detect PSU stocks."""
+    import numpy as np
+
+    # Get Nifty returns
+    nifty_stock = db.execute(
+        text("SELECT id FROM stocks WHERE symbol IN ('NIFTY 50', '^NSEI', 'NIFTY50') LIMIT 1")
+    ).fetchone()
+
+    if not nifty_stock:
+        return
+
+    nifty_prices = db.execute(
+        text("""
+            SELECT date, adj_close FROM eod_prices
+            WHERE stock_id = :sid AND date <= :d
+            ORDER BY date DESC LIMIT 252
+        """),
+        {"sid": nifty_stock[0], "d": target_date},
+    ).fetchall()
+
+    if len(nifty_prices) < 60:
+        return
+
+    nifty_returns = {}
+    nifty_list = list(reversed(nifty_prices))
+    for i in range(1, len(nifty_list)):
+        if nifty_list[i][1] and nifty_list[i - 1][1] and nifty_list[i - 1][1] > 0:
+            nifty_returns[nifty_list[i][0]] = (nifty_list[i][1] - nifty_list[i - 1][1]) / nifty_list[i - 1][1]
+
+    # Beta for each stock
+    stocks = db.execute(text("SELECT id, symbol FROM stocks WHERE is_active = true")).fetchall()
+    updated = 0
+    for stock_id, symbol in stocks:
+        prices = db.execute(
+            text("""
+                SELECT date, adj_close FROM eod_prices
+                WHERE stock_id = :sid AND date <= :d AND adj_close IS NOT NULL
+                ORDER BY date DESC LIMIT 252
+            """),
+            {"sid": stock_id, "d": target_date},
+        ).fetchall()
+
+        if len(prices) < 60:
+            continue
+
+        price_list = list(reversed(prices))
+        stock_rets = []
+        market_rets = []
+        for i in range(1, len(price_list)):
+            dt = price_list[i][0]
+            if dt in nifty_returns and price_list[i - 1][1] and price_list[i - 1][1] > 0:
+                sr = (price_list[i][1] - price_list[i - 1][1]) / price_list[i - 1][1]
+                stock_rets.append(sr)
+                market_rets.append(nifty_returns[dt])
+
+        if len(stock_rets) < 30:
+            continue
+
+        market_arr = np.array(market_rets)
+        stock_arr = np.array(stock_rets)
+        market_var = np.var(market_arr)
+        if market_var > 0:
+            beta = round(float(np.cov(stock_arr, market_arr)[0, 1] / market_var), 2)
+            db.execute(
+                text("UPDATE stocks SET beta = :beta WHERE id = :sid"),
+                {"beta": beta, "sid": stock_id},
+            )
+            updated += 1
+
+    # PSU detection: promoter name containing "Government" / "President of India"
+    db.execute(text("""
+        UPDATE stocks SET is_psu = true
+        WHERE id IN (
+            SELECT DISTINCT s.id FROM stocks s
+            JOIN shareholding_pattern sp ON sp.stock_id = s.id
+            WHERE s.promoter_holding_pct > 50
+        ) AND (
+            sector ILIKE '%public sector%' OR sector ILIKE '%psu%'
+            OR name ILIKE '%government%' OR name ILIKE '%india ltd%'
+        )
+    """))
+
+    db.commit()
+    if updated:
+        logger.info(f"[Beta/PSU] Updated beta for {updated} stocks")
+
+
+def _update_open_positions(
+    db: Session, target_date: date, regime: str, crash_warning: bool, strategy: StrategyConfig,
+) -> None:
+    """Update open positions: prices, gain phase, monster score, exit checks, cascade."""
+    from momentum_edge.db.models import OpenPosition, Signal
+    from momentum_edge.engine.exits import check_exits, determine_phase
+    from momentum_edge.engine.exit_cascade import evaluate_cascade
+    from momentum_edge.engine.monster import calculate_monster_score
+
+    # 1. Create positions from newly confirmed signals
+    confirmed = (
+        db.query(Signal)
+        .filter(Signal.status == "Confirmed", Signal.confirmed_date == target_date)
+        .all()
+    )
+    for sig in confirmed:
+        # Check if position already exists
+        existing = db.execute(
+            text("SELECT 1 FROM open_positions WHERE stock_id = :sid AND is_active = true"),
+            {"sid": sig.stock_id},
+        ).fetchone()
+        if existing:
+            continue
+
+        stock = db.execute(
+            text("SELECT symbol, sector FROM stocks WHERE id = :sid"),
+            {"sid": sig.stock_id},
+        ).fetchone()
+        if not stock:
+            continue
+
+        db.execute(
+            text("""
+                INSERT INTO open_positions (
+                    stock_id, symbol, sector, entry_date, entry_price, shares,
+                    current_stop, gain_phase, entry_regime, entry_composite_score,
+                    signal_id, pattern_type, tier, strategy_hash
+                ) VALUES (
+                    :sid, :sym, :sector, :date, :price, :shares,
+                    :stop, 'prove_it', :regime, :score,
+                    :signal_id, :pattern, :tier, :hash
+                ) ON CONFLICT (stock_id, entry_date) DO NOTHING
+            """),
+            {
+                "sid": sig.stock_id, "sym": stock[0], "sector": stock[1],
+                "date": target_date, "price": sig.pivot_price or 0,
+                "shares": 0,  # populated by position sizing at order time
+                "stop": sig.stop_loss, "regime": regime,
+                "score": sig.composite_score, "signal_id": sig.id,
+                "pattern": sig.pattern_type, "tier": sig.tier,
+                "hash": strategy.strategy_hash,
+            },
+        )
+
+    # 2. Update all active positions with current prices
+    positions = db.execute(
+        text("""
+            SELECT op.id, op.stock_id, op.symbol, op.entry_price, op.entry_date,
+                   op.current_stop, op.rs_below_floor_weeks, op.partial_exits_taken,
+                   op.monster_override_active, op.entry_atr,
+                   e.adj_close, e.low, e.high
+            FROM open_positions op
+            LEFT JOIN eod_prices e ON e.stock_id = op.stock_id AND e.date = :d
+            WHERE op.is_active = true
+        """),
+        {"d": target_date},
+    ).fetchall()
+
+    if not positions:
+        return
+
+    for pos in positions:
+        pos_id, stock_id, symbol = pos[0], pos[1], pos[2]
+        entry_price, entry_date = pos[3], pos[4]
+        adj_close = pos[10]
+
+        if adj_close is None:
+            continue
+
+        gain_pct = (adj_close - entry_price) / entry_price if entry_price > 0 else 0
+        phase = determine_phase(gain_pct, pos[8])  # monster_override_active
+        holding_days = (target_date - entry_date).days if entry_date else 0
+
+        # Monster score
+        monster_result = calculate_monster_score(
+            db, stock_id, symbol, target_date,
+            gain_pct=gain_pct, config=strategy.monster,
+        )
+
+        db.execute(
+            text("""
+                UPDATE open_positions SET
+                    current_price = :price, gain_pct = :gain,
+                    max_gain_pct = GREATEST(COALESCE(max_gain_pct, 0), :gain),
+                    holding_days = :days, gain_phase = :phase,
+                    monster_score = :mscore, monster_override_active = :mactive,
+                    updated_at = now()
+                WHERE id = :id
+            """),
+            {
+                "price": adj_close, "gain": round(gain_pct, 4),
+                "days": holding_days, "phase": phase.value,
+                "mscore": monster_result.score,
+                "mactive": monster_result.override_active,
+                "id": pos_id,
+            },
+        )
+
+    # 3. Run exit engine on active positions
+    active_positions = (
+        db.query(OpenPosition).filter(OpenPosition.is_active.is_(True)).all()
+    )
+    if active_positions:
+        exit_signals = check_exits(
+            db, active_positions, target_date, regime, crash_warning, strategy=strategy,
+        )
+        for sig in exit_signals:
+            if sig.action == "full_exit" or sig.exit_pct >= 1.0:
+                db.execute(
+                    text("""
+                        UPDATE open_positions SET
+                            is_active = false, closed_date = :d,
+                            exit_reason = :reason, exit_phase = :phase,
+                            exit_rule_name = :rule, updated_at = now()
+                        WHERE stock_id = :sid AND is_active = true
+                    """),
+                    {"d": target_date, "reason": sig.exit_type, "phase": sig.phase, "rule": sig.rule_name, "sid": sig.stock_id},
+                )
+            elif sig.action == "move_stop" and sig.new_stop:
+                db.execute(
+                    text("UPDATE open_positions SET current_stop = :stop, updated_at = now() WHERE stock_id = :sid AND is_active = true"),
+                    {"stop": sig.new_stop, "sid": sig.stock_id},
+                )
+
+        # 4. Run cascade
+        cascade_actions = evaluate_cascade(
+            db, active_positions, target_date, strategy.exits.cascade,
+        )
+        for action in cascade_actions:
+            logger.info(f"[Cascade] {action.layer}: {action.action} — {action.reason}")
+
+    db.commit()
+    logger.info(f"[Positions] {len(active_positions)} active, {len(confirmed)} new from signals")
+
+
 def run_m1(db: Session, target_date: date) -> None:
     """Run Module 1: data ingestion (prices + delivery + FII/DII + deals + surveillance)."""
     from momentum_edge.data.prices import ingest_daily_prices
@@ -158,6 +391,31 @@ def run_pipeline(
         f"crash={regime_result.crash_warning}, {regime_result.exposure})"
     )
 
+    # Persist regime to market_regime_log for stability rule
+    try:
+        db.execute(
+            text("""
+                INSERT INTO market_regime_log (date, regime, score, crash_warning, strategy_hash)
+                VALUES (:d, :r, :s, :c, :h)
+                ON CONFLICT (date) DO UPDATE SET
+                    regime = EXCLUDED.regime, score = EXCLUDED.score,
+                    crash_warning = EXCLUDED.crash_warning, strategy_hash = EXCLUDED.strategy_hash
+            """),
+            {"d": target_date, "r": regime, "s": regime_result.score,
+             "c": regime_result.crash_warning, "h": strategy_hash},
+        )
+    except Exception:
+        db.rollback()
+
+    # v16: Bull entry protocol (gates capital deployment during Bear recovery)
+    if regime in ("Bear", "Full Bear") and strategy.regime.bull_entry_protocol.enabled:
+        from momentum_edge.engine.bull_entry import evaluate_bull_entry_phase
+        bull_result = evaluate_bull_entry_phase(
+            db, target_date, regime,
+            config=strategy.regime.bull_entry_protocol,
+        )
+        logger.info(f"[BullEntry] Phase: {bull_result.phase.value} — {bull_result.reason}")
+
     # M3: Sector rotation ranking
     with _log_step(db, target_date, "m3_sector_rotation", strategy_hash):
         sector_config = strategy.scoring.get_module("sector")
@@ -165,6 +423,10 @@ def run_pipeline(
         sector_ranks = rank_sectors(db, target_date, params=sector_params)
     total_sectors = len(sector_ranks)
     logger.info(f"[M3] Sectors ranked: {total_sectors}")
+
+    # v16: Compute beta + detect PSU stocks (periodic, runs daily)
+    with _log_step(db, target_date, "beta_psu_update", strategy_hash):
+        _update_beta_and_psu(db, target_date)
 
     # Universe filter: apply hard blocks from strategy
     with _log_step(db, target_date, "universe_filter", strategy_hash):
@@ -269,6 +531,27 @@ def run_pipeline(
             db, target_date, regime, sector_ranks,
             strategy=strategy,
         )
+
+    # ── v16: Fast crash detection ─────────────────────────────────────
+    with _log_step(db, target_date, "fast_crash", strategy_hash):
+        from momentum_edge.engine.fast_crash import detect_fast_crash
+
+        crash_result = detect_fast_crash(db, target_date, config=strategy.regime.fast_crash)
+        if crash_result.is_active:
+            logger.warning(f"[FastCrash] {crash_result.reason}")
+
+    # ── v16: Position lifecycle ───────────────────────────────────────
+    with _log_step(db, target_date, "positions", strategy_hash):
+        _update_open_positions(db, target_date, regime, regime_result.crash_warning, strategy)
+
+    # ── v16: Turnaround watch ─────────────────────────────────────────
+    with _log_step(db, target_date, "turnaround_scan", strategy_hash):
+        from momentum_edge.engine.turnaround import scan_turnarounds
+
+        turnarounds = scan_turnarounds(db, target_date, strategy=strategy)
+        if turnarounds:
+            active = sum(1 for t in turnarounds if not t.suppressed)
+            logger.info(f"[Turnaround] {active} active, {len(turnarounds) - active} suppressed")
 
     logger.info(f"=== Pipeline finished for {target_date} [{strategy_hash}] ===")
     logger.info(

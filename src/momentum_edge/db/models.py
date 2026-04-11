@@ -483,6 +483,22 @@ class TurnaroundWatch(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class MarketRegimeLog(Base):
+    """Daily market regime history for stability rule."""
+
+    __tablename__ = "market_regime_log"
+    __table_args__ = (UniqueConstraint("date", name="uq_regime_log_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    regime: Mapped[str] = mapped_column(String(20), nullable=False)
+    score: Mapped[float | None] = mapped_column(Float)
+    crash_warning: Mapped[bool] = mapped_column(Boolean, default=False)
+    fast_crash_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    strategy_hash: Mapped[str | None] = mapped_column(String(12))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class PipelineLog(Base):
     """Step-by-step pipeline execution log."""
 
